@@ -1,0 +1,2 @@
+# Preserve checkpoint bytes and SHA256 evidence across operating systems.
+reports/checkpoints/2026-09-10/** -text
