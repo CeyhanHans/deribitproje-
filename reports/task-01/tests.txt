@@ -1,0 +1,35 @@
+test_decimal_normalization_and_arithmetic_on_frozen_dataclasses (tests.test_contracts_v1.TestContractsV1.test_decimal_normalization_and_arithmetic_on_frozen_dataclasses)
+Verify that string or float values passed to financial fields are normalized to Decimal. ... ok
+test_financial_fields_serialize_as_strings (tests.test_contracts_v1.TestContractsV1.test_financial_fields_serialize_as_strings)
+Verify that all Decimal fields serialize to JSON as strings, never raw floats. ... ok
+test_frozen_immutability (tests.test_contracts_v1.TestContractsV1.test_frozen_immutability)
+Ensure all contract dataclasses are frozen and immutable. ... ok
+test_inverse_option_currency_conventions (tests.test_contracts_v1.TestContractsV1.test_inverse_option_currency_conventions)
+Verify Instrument default and configurable currency fields for BTC inverse options. ... ok
+test_json_roundtrip_all_dataclasses (tests.test_contracts_v1.TestContractsV1.test_json_roundtrip_all_dataclasses)
+Verify perfect round-trip serialization and deserialization for all dataclasses. ... ok
+test_metrics_win_rate_optional_when_zero_trades (tests.test_contracts_v1.TestContractsV1.test_metrics_win_rate_optional_when_zero_trades)
+Verify Metrics accepts win_rate=None when total_trades == 0. ... ok
+test_price_observation_size_validation_and_lookahead_rejection (tests.test_contracts_v1.TestContractsV1.test_price_observation_size_validation_and_lookahead_rejection)
+Verify PriceObservation rejects NaN sizes and bucket lookahead. ... ok
+test_provider_protocols_runtime_checkable (tests.test_contracts_v1.TestContractsV1.test_provider_protocols_runtime_checkable)
+Verify provider protocols are runtime checkable. ... ok
+test_reject_bool_in_numeric_fields (tests.test_contracts_v1.TestContractsV1.test_reject_bool_in_numeric_fields)
+Ensure boolean values are strictly rejected where numbers or timestamps are expected. ... ok
+test_reject_invalid_enum_values (tests.test_contracts_v1.TestContractsV1.test_reject_invalid_enum_values)
+Ensure invalid enum strings are rejected upon construction and deserialization. ... ok
+test_reject_nan_and_infinity (tests.test_contracts_v1.TestContractsV1.test_reject_nan_and_infinity)
+Ensure NaN and Infinity (float or Decimal) are rejected. ... ok
+test_schema_version_validation_and_mismatch (tests.test_contracts_v1.TestContractsV1.test_schema_version_validation_and_mismatch)
+Validate strict schema_version enforcement. ... ok
+test_standard_library_only (tests.test_contracts_v1.TestContractsV1.test_standard_library_only)
+Verify that core/contracts.py only imports standard library modules. ... ok
+test_strict_from_dict_rejects_unknown_fields (tests.test_contracts_v1.TestContractsV1.test_strict_from_dict_rejects_unknown_fields)
+Verify from_dict raises ValidationError when unknown fields are supplied. ... ok
+test_time_range_and_lookahead_boundaries (tests.test_contracts_v1.TestContractsV1.test_time_range_and_lookahead_boundaries)
+Validate [start, end) time ranges and lookahead prevention rules. ... ok
+
+----------------------------------------------------------------------
+Ran 15 tests in 0.040s
+
+OK

@@ -1,0 +1,12 @@
+[
+  {
+    "path": "strategies/signals.py",
+    "before_sha256": null,
+    "after_sha256": "cf3676249056fbe7b7598c54b319cf1077347a53f28713da0166ff4c7d3be46b"
+  },
+  {
+    "path": "tests/test_signals.py",
+    "before_sha256": null,
+    "after_sha256": "ecdc373496823fd2c2f9ba97a94acba1640bf42f04f65d792af543309f542b73"
+  }
+]

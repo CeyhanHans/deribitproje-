@@ -1,0 +1,35 @@
+test_atm_selection_closest_common_strike (tests.test_contract_catalog.ContractCatalogTests.test_atm_selection_closest_common_strike) ... ok
+test_benchmark_120k_synthetic_records_scale_and_candidates_measured (tests.test_contract_catalog.ContractCatalogTests.test_benchmark_120k_synthetic_records_scale_and_candidates_measured)
+Verify performance and memory efficiency on 120,000 synthetic option records. ... ok
+test_catalog_query_validation_rejects_nan_inf_and_booleans (tests.test_contract_catalog.ContractCatalogTests.test_catalog_query_validation_rejects_nan_inf_and_booleans)
+CatalogQuery must reject NaN, Infinity, negative values, and boolean types across all fields. ... ok
+test_creation_timestamp_lookahead_rejection (tests.test_contract_catalog.ContractCatalogTests.test_creation_timestamp_lookahead_rejection) ... ok
+test_direct_contract_spec_constructor_validates_dates_and_numerics (tests.test_contract_catalog.ContractCatalogTests.test_direct_contract_spec_constructor_validates_dates_and_numerics)
+Direct ContractSpec instantiation must run full validation. ... ok
+test_duplicate_deduplication_and_conflicting_record_rejection (tests.test_contract_catalog.ContractCatalogTests.test_duplicate_deduplication_and_conflicting_record_rejection)
+Exact identical duplicate records are deduped; conflicting records raise error. ... ok
+test_empty_catalog_and_invalid_query_are_graceful (tests.test_contract_catalog.ContractCatalogTests.test_empty_catalog_and_invalid_query_are_graceful) ... ok
+test_equidistant_tie_break_is_deterministic (tests.test_contract_catalog.ContractCatalogTests.test_equidistant_tie_break_is_deterministic) ... ok
+test_expired_contract_rejection (tests.test_contract_catalog.ContractCatalogTests.test_expired_contract_rejection) ... ok
+test_first_candidate_expiry_missing_leg_falls_back_to_second_expiry (tests.test_contract_catalog.ContractCatalogTests.test_first_candidate_expiry_missing_leg_falls_back_to_second_expiry)
+If expiry 1 only has Call and no Put, catalog must evaluate next candidate expiry. ... ok
+test_future_expiry_created_in_past_accepted_even_if_is_active_false (tests.test_contract_catalog.ContractCatalogTests.test_future_expiry_created_in_past_accepted_even_if_is_active_false)
+Historical contracts with is_active=False must be eligible as long as creation <= T < expiry. ... ok
+test_future_records_in_expired_catalog_are_filtered (tests.test_contract_catalog.ContractCatalogTests.test_future_records_in_expired_catalog_are_filtered) ... ok
+test_mismatched_metadata_rejected (tests.test_contract_catalog.ContractCatalogTests.test_mismatched_metadata_rejected)
+Mismatched option_type, strike, currency, or invalid timestamps must raise ContractCatalogError. ... ok
+test_missing_leg_returns_none (tests.test_contract_catalog.ContractCatalogTests.test_missing_leg_returns_none) ... ok
+test_parametric_dte_and_target_expiry (tests.test_contract_catalog.ContractCatalogTests.test_parametric_dte_and_target_expiry) ... ok
+test_real_deribit_pilot_sample_records_parsed_successfully (tests.test_contract_catalog.ContractCatalogTests.test_real_deribit_pilot_sample_records_parsed_successfully)
+Real Deribit records with quote_currency='BTC' and counter_currency='USD' must parse cleanly. ... ok
+test_result_is_repeatable (tests.test_contract_catalog.ContractCatalogTests.test_result_is_repeatable) ... ok
+test_shuffled_input_determinism (tests.test_contract_catalog.ContractCatalogTests.test_shuffled_input_determinism)
+Loading records in shuffled order produces byte-for-byte identical selection. ... ok
+test_strict_same_strike_and_expiry_enforcement (tests.test_contract_catalog.ContractCatalogTests.test_strict_same_strike_and_expiry_enforcement) ... ok
+test_t_equal_creation_accepted_and_t_equal_expiry_rejected (tests.test_contract_catalog.ContractCatalogTests.test_t_equal_creation_accepted_and_t_equal_expiry_rejected)
+At T == creation, contract is active. At T == expiry (0 DTE boundary), contract is rejected. ... ok
+
+----------------------------------------------------------------------
+Ran 20 tests in 7.419s
+
+OK

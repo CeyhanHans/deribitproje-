@@ -1,0 +1,29 @@
+test_applies_slippage_and_fee_to_estimated_fill (tests.test_backtest_engine.BacktestEngineTests.test_applies_slippage_and_fee_to_estimated_fill) ... ok
+test_changing_btc_usd_rate_fixtures (tests.test_backtest_engine.BacktestEngineTests.test_changing_btc_usd_rate_fixtures)
+Verify USD cashflow conversion under rising and falling BTC/USD rates. ... ok
+test_inverse_option_fee_respects_twelve_point_five_percent_premium_cap (tests.test_backtest_engine.BacktestEngineTests.test_inverse_option_fee_respects_twelve_point_five_percent_premium_cap) ... ok
+test_inverse_option_fee_uses_contract_amount_not_premium_rate (tests.test_backtest_engine.BacktestEngineTests.test_inverse_option_fee_uses_contract_amount_not_premium_rate) ... ok
+test_rejects_duplicate_timestamps_within_leg_series (tests.test_backtest_engine.BacktestEngineTests.test_rejects_duplicate_timestamps_within_leg_series)
+A leg cannot contain duplicate timestamps. ... ok
+test_rejects_instrument_change_within_leg_series (tests.test_backtest_engine.BacktestEngineTests.test_rejects_instrument_change_within_leg_series)
+A leg's observations must keep the same instrument name throughout the series. ... ok
+test_rejects_missing_leg_observations (tests.test_backtest_engine.BacktestEngineTests.test_rejects_missing_leg_observations) ... ok
+test_rejects_nan_and_infinity_in_observations (tests.test_backtest_engine.BacktestEngineTests.test_rejects_nan_and_infinity_in_observations)
+NaN and Infinity in prices or rates must be rejected. ... ok
+test_rejects_negative_costs_in_execution_model (tests.test_backtest_engine.BacktestEngineTests.test_rejects_negative_costs_in_execution_model)
+Negative slippage or fee rates must be rejected. ... ok
+test_rejects_unsupported_entry_rule_parameters (tests.test_backtest_engine.BacktestEngineTests.test_rejects_unsupported_entry_rule_parameters)
+Legacy engine does not evaluate parameters on entry rules and must reject non-empty parameters. ... ok
+test_rejects_unsupported_entry_rules (tests.test_backtest_engine.BacktestEngineTests.test_rejects_unsupported_entry_rules)
+Legacy engine only supports 'enter_when_chain_has_required_legs'. ... ok
+test_runs_stop_loss_backtest (tests.test_backtest_engine.BacktestEngineTests.test_runs_stop_loss_backtest) ... ok
+test_runs_two_leg_take_profit_backtest (tests.test_backtest_engine.BacktestEngineTests.test_runs_two_leg_take_profit_backtest) ... ok
+test_untriggered_exit_rules_close_at_last_observation_price_not_entry (tests.test_backtest_engine.BacktestEngineTests.test_untriggered_exit_rules_close_at_last_observation_price_not_entry)
+CRITICAL FIX: When no exit rule triggers, position must close at the final ... ok
+test_zero_settlement_price_allowed_while_zero_trade_price_rejected (tests.test_backtest_engine.BacktestEngineTests.test_zero_settlement_price_allowed_while_zero_trade_price_rejected)
+A standard trade price of 0.0 is invalid, but a settlement price of 0.0 (OTM expiry) is valid. ... ok
+
+----------------------------------------------------------------------
+Ran 15 tests in 0.012s
+
+OK

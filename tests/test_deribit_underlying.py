@@ -19,6 +19,11 @@ from ingestion.deribit_underlying import (
     plan_underlying_window_requests,
     parse_tradingview_response,
     write_underlying_bars_json,
+    merge_and_dedup_bars,
+    find_missing_underlying_intervals,
+    compute_underlying_coverage,
+    fetch_underlying_series,
+    UnderlyingCoverageReport,
 )
 
 
@@ -307,3 +312,149 @@ class DeribitUnderlyingTests(unittest.TestCase):
             self.assertEqual(payload["bar_count"], 1)
             self.assertEqual(payload["bars"][0]["open"], 60000.0)
             self.assertIn("timestamp_utc", payload["bars"][0])
+
+    def test_merge_and_dedup_bars_sorted_and_deduplicated(self):
+        req = UnderlyingRequest(1_700_000_000_000, 1_700_014_400_000)
+        sample1 = {
+            "status": "ok",
+            "ticks": [1_700_000_000_000, 1_700_003_600_000],
+            "open": [60000.0, 60500.0],
+            "high": [60800.0, 61000.0],
+            "low": [59900.0, 60200.0],
+            "close": [60500.0, 60900.0],
+            "volume": [10.0, 20.0],
+            "cost": [600000.0, 1200000.0],
+        }
+        sample2 = {
+            "status": "ok",
+            # Overlapping tick at 1_700_003_600_000, plus new tick at 1_700_007_200_000
+            "ticks": [1_700_003_600_000, 1_700_007_200_000],
+            "open": [60500.0, 60900.0],
+            "high": [61000.0, 61500.0],
+            "low": [60200.0, 60800.0],
+            "close": [60900.0, 61200.0],
+            "volume": [20.0, 30.0],
+            "cost": [1200000.0, 1800000.0],
+        }
+        chunk1 = parse_tradingview_response(sample1, req)
+        chunk2 = parse_tradingview_response(sample2, req)
+
+        # Merge chunks (with overlap)
+        merged = merge_and_dedup_bars([chunk1, chunk2])
+        self.assertEqual(len(merged), 3)
+        self.assertEqual([b.timestamp_ms for b in merged], [1_700_000_000_000, 1_700_003_600_000, 1_700_007_200_000])
+
+    def test_merge_and_dedup_bars_conflicting_data_raises_error(self):
+        req = UnderlyingRequest(1_700_000_000_000, 1_700_007_200_000)
+        sample1 = {
+            "status": "ok",
+            "ticks": [1_700_000_000_000],
+            "open": [60000.0],
+            "high": [60800.0],
+            "low": [59900.0],
+            "close": [60500.0],
+        }
+        sample2 = {
+            "status": "ok",
+            "ticks": [1_700_000_000_000],
+            "open": [60000.0],
+            "high": [62500.0],
+            "low": [59900.0],
+            "close": [62000.0],  # Conflicting close!
+        }
+        chunk1 = parse_tradingview_response(sample1, req)
+        chunk2 = parse_tradingview_response(sample2, req)
+
+        with self.assertRaisesRegex(DeribitUnderlyingError, "conflicting underlying bar data"):
+            merge_and_dedup_bars([chunk1, chunk2])
+
+    def test_find_missing_underlying_intervals(self):
+        req = UnderlyingRequest(1_700_000_000_000, 1_700_014_400_000)
+        # 4 hours total: 0, 3600, 7200, 10800. Provide 0 and 7200 -> missing 3600 and 10800.
+        sample = {
+            "status": "ok",
+            "ticks": [1_700_000_000_000, 1_700_007_200_000],
+            "open": [60000.0, 61000.0],
+            "high": [60500.0, 61500.0],
+            "low": [59500.0, 60500.0],
+            "close": [60200.0, 61200.0],
+        }
+        bars = parse_tradingview_response(sample, req)
+
+        missing = find_missing_underlying_intervals(
+            bars,
+            start_timestamp=1_700_000_000_000,
+            end_timestamp=1_700_014_400_000,
+            step_ms=HOUR_MS,
+        )
+        expected_missing = (
+            (1_700_003_600_000, 1_700_007_200_000),
+            (1_700_010_800_000, 1_700_014_400_000),
+        )
+        self.assertEqual(missing, expected_missing)
+
+    def test_compute_underlying_coverage(self):
+        req = UnderlyingRequest(1_700_000_000_000, 1_700_014_400_000)
+        # 4 hours expected, provide 3 bars (0, 3600, 7200) -> 75% coverage
+        sample = {
+            "status": "ok",
+            "ticks": [1_700_000_000_000, 1_700_003_600_000, 1_700_007_200_000],
+            "open": [60000.0, 60500.0, 61000.0],
+            "high": [60500.0, 61000.0, 61500.0],
+            "low": [59500.0, 60000.0, 60500.0],
+            "close": [60200.0, 60800.0, 61200.0],
+        }
+        bars = parse_tradingview_response(sample, req)
+
+        report = compute_underlying_coverage(
+            bars,
+            start_timestamp=1_700_000_000_000,
+            end_timestamp=1_700_014_400_000,
+            step_ms=HOUR_MS,
+        )
+        self.assertEqual(report.expected_intervals, 4)
+        self.assertEqual(report.observed_intervals, 3)
+        self.assertEqual(report.missing_intervals_count, 1)
+        self.assertEqual(report.coverage_ratio, 0.75)
+        self.assertEqual(report.missing_intervals, ((1_700_010_800_000, 1_700_014_400_000),))
+
+    @patch("ingestion.deribit_underlying.urlopen")
+    def test_fetch_underlying_series_multi_chunk_mock(self, mock_urlopen):
+        # Two chunk responses:
+        resp1 = FakeResponse({
+            "result": {
+                "status": "ok",
+                "ticks": [1_700_000_000_000, 1_700_003_600_000],
+                "open": [50000.0, 50100.0],
+                "high": [50200.0, 50300.0],
+                "low": [49900.0, 50000.0],
+                "close": [50100.0, 50200.0],
+            }
+        })
+        resp2 = FakeResponse({
+            "result": {
+                "status": "ok",
+                "ticks": [1_700_003_600_000, 1_700_007_200_000],
+                "open": [50100.0, 50200.0],
+                "high": [50300.0, 50400.0],
+                "low": [50000.0, 50100.0],
+                "close": [50200.0, 50300.0],
+            }
+        })
+        mock_urlopen.side_effect = [resp1, resp2]
+
+        bars = fetch_underlying_series(
+            start_timestamp=1_700_000_000_000,
+            end_timestamp=1_700_007_200_000,
+            max_hours=1,  # Forces 2 chunks of 1h
+        )
+        self.assertEqual(len(bars), 3)
+        self.assertEqual(
+            [b.timestamp_ms for b in bars],
+            [1_700_000_000_000, 1_700_003_600_000, 1_700_007_200_000],
+        )
+
+    def test_proxy_quality_label_preserved(self):
+        self.assertEqual(DEFAULT_DATA_QUALITY_LABEL, "official-tradingview-perpetual-kline-proxy")
+        self.assertEqual(DEFAULT_SERIES_TYPE, "perpetual_kline_proxy")
+

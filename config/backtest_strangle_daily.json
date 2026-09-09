@@ -1,0 +1,98 @@
+{
+  "run_name": "backtest_strangle_daily",
+  "strategy_name": "btc_inverse_strangle_daily",
+  "version": "1.0",
+  "start_time": "2024-07-01T00:00:00Z",
+  "end_time": "2025-01-01T00:00:00Z",
+  "decision_resolution": "1d",
+  "underlying": "BTC",
+  "settlement_currency": "BTC",
+  "contract_type": "inverse",
+  "initial_cash_btc": "5.0",
+  "sizing": {
+    "type": "fixed_quantity",
+    "value": 1.0
+  },
+  "max_open_positions": 1,
+  "margin_model": "conservative_stress_reserve",
+  "stress_reserve_ratio": "0.5",
+  "execution_profile": {
+    "execution_model_id": "model_a_bid_ask",
+    "fee_rate_amount": "0.0003",
+    "fee_cap_ratio": "0.125",
+    "slippage_btc": "0"
+  },
+  "data_policy": {
+    "allow_missing_bars": false,
+    "price_basis": "trade_and_quotes"
+  },
+  "strategy": {
+    "name": "btc_inverse_strangle_daily",
+    "version": "1.0",
+    "legs": [
+      {
+        "name": "otm_call",
+        "option_type": "call",
+        "side": "long",
+        "quantity": 1.0,
+        "strike": {
+          "type": "moneyness_percent",
+          "value": 105.0
+        },
+        "expiry": {
+          "type": "nearest_days_to_expiry",
+          "value": 30
+        }
+      },
+      {
+        "name": "otm_put",
+        "option_type": "put",
+        "side": "long",
+        "quantity": 1.0,
+        "strike": {
+          "type": "moneyness_percent",
+          "value": 95.0
+        },
+        "expiry": {
+          "type": "nearest_days_to_expiry",
+          "value": 30
+        },
+        "same_expiry_as": "otm_call"
+      }
+    ],
+    "entry_rules": [
+      {
+        "name": "periodic_calendar_entry",
+        "parameters": {
+          "interval_days": 7
+        }
+      }
+    ],
+    "exit_rules": [
+      {
+        "type": "expiry_exit",
+        "value": "at_expiry"
+      }
+    ],
+    "fee_spread_model": "deribit_inverse_option_bid_ask",
+    "result_metrics": [
+      {
+        "name": "trade_count",
+        "description": "Number of completed strategy trades."
+      },
+      {
+        "name": "net_pnl_usd",
+        "description": "Total profit and loss in USD after fees and spread."
+      },
+      {
+        "name": "max_drawdown_usd",
+        "description": "Largest peak-to-trough net USD loss."
+      },
+      {
+        "name": "win_rate",
+        "description": "Share of completed trades with positive net PnL."
+      }
+    ],
+    "notes": "Canonical 1d Daily OTM Strangle backtest covering H2 2024."
+  }
+}

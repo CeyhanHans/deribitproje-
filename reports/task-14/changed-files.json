@@ -1,0 +1,27 @@
+[
+  {
+    "path": "research/pilot.py",
+    "before_sha256": null,
+    "after_sha256": "0af32c3ada74daecd522e1c2c6ab7a885c1474404b12163f990633d12f1bd04e"
+  },
+  {
+    "path": "tests/test_pilot.py",
+    "before_sha256": null,
+    "after_sha256": "d1068cd1feb400556bd0b91b93c4a924a0ae15c019e2c9f7cfa97898d5c705b0"
+  },
+  {
+    "path": "reports/pilot/manifest.json",
+    "before_sha256": null,
+    "after_sha256": "eff301c490bf1c0c52c5621a6ce1a1a3a4433d728f44f428f92d73a0380e95b3"
+  },
+  {
+    "path": "reports/pilot/pilot_report.md",
+    "before_sha256": null,
+    "after_sha256": "b0f0be883b93d00abeeb77b82d8982527d59c8aab02d728588c087f380e31b9c"
+  },
+  {
+    "path": "reports/pilot/catalog_sample.json",
+    "before_sha256": null,
+    "after_sha256": "8b314baf96181a67768119c50475628a93cbca8cc00a1373e77112a0005b7b4c"
+  }
+]

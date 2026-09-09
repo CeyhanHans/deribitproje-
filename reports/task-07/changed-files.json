@@ -1,0 +1,22 @@
+[
+  {
+    "path": "ingestion/historical_windows.py",
+    "before_sha256": "b22a6ced974d7fae783a25738be4fa04605892c10b56f8f3979ea26cf889ba1e",
+    "after_sha256": "9202ef4311559eec2e880f3bbeccd1fc857d5f2fc43cf55bf0214839e469fe94"
+  },
+  {
+    "path": "strategies/leg_matcher.py",
+    "before_sha256": "7c4af0614737f0859974a2700647b52f4a91c8dd45e29ffe21e267fc0395ed6c",
+    "after_sha256": "d8d7ed5255369905178825e04abe3e450b1d029d043d19fd847a741f951fc494"
+  },
+  {
+    "path": "tests/test_historical_windows.py",
+    "before_sha256": "78ec2c3aa3f66c7b7cf513487c96b165fe37076792a28f428e849263ba1db2fd",
+    "after_sha256": "b11a2e76bf85c6198863f249fc270d272cc0fb6563ec46a1b37ff3c8ba7ebd4a"
+  },
+  {
+    "path": "tests/test_leg_matcher.py",
+    "before_sha256": "69ee801d383c96ab949706c3ec75b0562076d25c51c462d61dc2879de70f0c81",
+    "after_sha256": "95b2335986deab622219826ed9fbcb138162083a8b1eb1827bcd5a00bc319315"
+  }
+]

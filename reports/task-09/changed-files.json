@@ -1,0 +1,12 @@
+[
+  {
+    "path": "strategies/selection.py",
+    "before_sha256": null,
+    "after_sha256": "51c54f999b633be61322a4d1df3c84716d1471fa71085197c2ece1a925013513"
+  },
+  {
+    "path": "tests/test_selection.py",
+    "before_sha256": null,
+    "after_sha256": "48c605ed2ac7b132d9a713410c799793f378ccc28ad3438e782bef962828c18f"
+  }
+]

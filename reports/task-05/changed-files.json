@@ -1,0 +1,56 @@
+[
+  {
+    "path": "storage/__init__.py",
+    "before_sha256": null,
+    "after_sha256": "00acf3de8e8aba4989dc8031adc2fc6e657b016eef618c15d9840697a7f7018a",
+    "status": "created"
+  },
+  {
+    "path": "storage/models.py",
+    "before_sha256": null,
+    "after_sha256": "de895479a371883d1a58bbcd984f66a3b5767b9a74fc965d4a13bd9b9b20823f",
+    "status": "created"
+  },
+  {
+    "path": "storage/archive.py",
+    "before_sha256": null,
+    "after_sha256": "cb778cff18a0e901da10fa2eb12043bd2929f5ffdc68d35864ab5de3410eff59",
+    "status": "created"
+  },
+  {
+    "path": "storage/sqlite_index.py",
+    "before_sha256": null,
+    "after_sha256": "4ad86a4b787bb7dd535848bfb4efa1be6c5b2e78c1711b47d6479564491c9685",
+    "status": "created"
+  },
+  {
+    "path": "storage/engine.py",
+    "before_sha256": null,
+    "after_sha256": "764a4383026113afe7474fcbe24a795da68804ec8693f2aec552d60170a2e5e5",
+    "status": "created"
+  },
+  {
+    "path": "tests/test_storage_v1.py",
+    "before_sha256": null,
+    "after_sha256": "e3831423ee6b1648156132e875678a6e41fca4f3f7be73313f6352ebe9740d59",
+    "status": "created"
+  },
+  {
+    "path": "reports/task-05/tests.txt",
+    "before_sha256": null,
+    "after_sha256": "4d30abad3dbbbb19f3a6a065ff769d2919fe887531d104a9c1ad746f873c895e",
+    "status": "created"
+  },
+  {
+    "path": "reports/task-05/changes.patch",
+    "before_sha256": null,
+    "after_sha256": "441a7f29849cc9cbf1e4000f8fab09381a92145118d3f522fe416a626df6ed46",
+    "status": "created"
+  },
+  {
+    "path": "reports/task-05/delivery.md",
+    "before_sha256": null,
+    "after_sha256": "fd1051e579b6646b694a566f8f9059528917b3327b13d9610c49bc35c8994192",
+    "status": "created"
+  }
+]

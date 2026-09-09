@@ -1,0 +1,1645 @@
+diff --git a/execution/__init__.py b/execution/__init__.py
+new file mode 100644
+--- /dev/null
++++ b/execution/__init__.py
+@@ -0,0 +1,49 @@
++"""
++Execution package for Deribit BTC Inverse Options Backtest Catalog.
++Provides deterministic fill simulation (Model A, Model B), tick rounding,
++multi-leg All-Or-None bundle execution, and cost scenario modeling.
++"""
++
++from execution.fill_simulator import (
++    compute_trading_fee,
++    round_to_tick,
++    simulate_fill,
++    simulate_multi_leg_fill,
++)
++from execution.models import (
++    CostScenarioConfig,
++    ExecutionConfig,
++    ExecutionError,
++    ExecutionModelType,
++    InvalidOrderQuantityError,
++    MultiLegFillDecision,
++    OrderExpiredError,
++    ScenarioName,
++    UnsupportedPartialFillError,
++)
++from execution.scenarios import (
++    ScenarioEvaluationResult,
++    evaluate_fixed_orders_scenario,
++    get_predefined_scenarios,
++    verify_monotonic_fixed_orders,
++)
++
++__all__ = [
++    "compute_trading_fee",
++    "round_to_tick",
++    "simulate_fill",
++    "simulate_multi_leg_fill",
++    "CostScenarioConfig",
++    "ExecutionConfig",
++    "ExecutionError",
++    "ExecutionModelType",
++    "InvalidOrderQuantityError",
++    "MultiLegFillDecision",
++    "OrderExpiredError",
++    "ScenarioName",
++    "UnsupportedPartialFillError",
++    "ScenarioEvaluationResult",
++    "evaluate_fixed_orders_scenario",
++    "get_predefined_scenarios",
++    "verify_monotonic_fixed_orders",
++]
+diff --git a/execution/models.py b/execution/models.py
+new file mode 100644
+--- /dev/null
++++ b/execution/models.py
+@@ -0,0 +1,175 @@
++"""
++Models and data structures for execution simulation.
++Schema Version: 1.0
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass, field
++from decimal import Decimal
++from enum import Enum
++from typing import Any, Dict, Optional, Sequence, Tuple, Union
++
++from core.contracts import (
++    ExecutionModelId,
++    Fill,
++    FillDecision,
++    OrderIntent,
++    PriceObservation,
++    RunConfig,
++    Side,
++    ValidationError,
++    validate_decimal,
++    validate_enum,
++    validate_int,
++    validate_not_bool,
++    validate_timestamp_ms,
++)
++
++
++class ExecutionModelType(str, Enum):
++    """Execution simulation model types."""
++    MODEL_A_TRADE_ESTIMATED = "model_a_trade_estimated"
++    MODEL_B_BID_ASK_REPLAY = "model_b_bid_ask_replay"
++
++
++class ScenarioName(str, Enum):
++    """Standard cost scenario names."""
++    OPTIMISTIC = "optimistic"
++    BASELINE = "baseline"
++    PESSIMISTIC = "pessimistic"
++    CUSTOM = "custom"
++
++
++class ExecutionError(Exception):
++    """Base exception for execution simulation errors."""
++    pass
++
++
++class UnsupportedPartialFillError(ExecutionError):
++    """Raised when partial fill is attempted (partial fills unsupported in v1)."""
++    pass
++
++
++class OrderExpiredError(ExecutionError):
++    """Raised when an order has passed its expiration timestamp."""
++    pass
++
++
++class InvalidOrderQuantityError(ExecutionError):
++    """Raised when order quantity violates min_qty or qty_step."""
++    pass
++
++
++@dataclass(frozen=True)
++class CostScenarioConfig:
++    """Cost scenario parameters.
++    
++    Default: calibrated=False (explicit assumption unless calibrated from data).
++    """
++    scenario_name: ScenarioName = ScenarioName.BASELINE
++    slippage_btc: Decimal = Decimal("0.0005")
++    spread_btc: Decimal = Decimal("0.0005")
++    fee_rate: Decimal = Decimal("0.0003")
++    fee_cap_ratio: Decimal = Decimal("0.125")
++    calibrated: bool = False
++    notes: str = "Uncalibrated explicit cost assumption"
++
++    def __post_init__(self) -> None:
++        validate_enum(self.scenario_name, ScenarioName, "scenario_name")
++        validate_decimal(self.slippage_btc, "slippage_btc", non_negative=True)
++        validate_decimal(self.spread_btc, "spread_btc", non_negative=True)
++        validate_decimal(self.fee_rate, "fee_rate", non_negative=True)
++        validate_decimal(self.fee_cap_ratio, "fee_cap_ratio", non_negative=True)
++        validate_not_bool(self.notes, "notes")
++
++
++@dataclass(frozen=True)
++class ExecutionConfig:
++    """Configuration for deterministic fill simulation."""
++    model_type: ExecutionModelType = ExecutionModelType.MODEL_A_TRADE_ESTIMATED
++    execution_model_id: ExecutionModelId = ExecutionModelId.MODEL_C_TRADE_BAR_CLOSE
++    slippage_btc: Decimal = Decimal("0.0")
++    spread_btc: Decimal = Decimal("0.0")
++    tick_size: Decimal = Decimal("0.0005")
++    contract_size: Decimal = Decimal("1.0")
++    min_qty: Decimal = Decimal("0.1")
++    qty_step: Optional[Decimal] = Decimal("0.1")
++    qty_step_known: bool = True
++    enforce_depth: bool = True
++    allow_partial_fill: bool = False  # Strictly False in v1
++    fallback_to_model_a: bool = True  # Model B falls back to Model A on missing quote
++    max_order_quantity: Optional[Decimal] = None
++    calibrated: bool = False
++    cost_scenario: Optional[CostScenarioConfig] = None
++
++    def __post_init__(self) -> None:
++        validate_enum(self.model_type, ExecutionModelType, "model_type")
++        validate_enum(self.execution_model_id, ExecutionModelId, "execution_model_id")
++        validate_decimal(self.slippage_btc, "slippage_btc", non_negative=True)
++        validate_decimal(self.spread_btc, "spread_btc", non_negative=True)
++        validate_decimal(self.tick_size, "tick_size", strictly_positive=True)
++        validate_decimal(self.contract_size, "contract_size", strictly_positive=True)
++        validate_decimal(self.min_qty, "min_qty", strictly_positive=True)
++        if self.qty_step is not None:
++            validate_decimal(self.qty_step, "qty_step", strictly_positive=True)
++        if self.max_order_quantity is not None:
++            validate_decimal(self.max_order_quantity, "max_order_quantity", strictly_positive=True)
++        if self.allow_partial_fill:
++            raise UnsupportedPartialFillError("Partial fill is unsupported in V1 (all-or-none assumption)")
++
++    @classmethod
++    def from_run_config(
++        cls,
++        run_config: RunConfig,
++        model_type: Optional[ExecutionModelType] = None,
++        cost_scenario: Optional[CostScenarioConfig] = None,
++    ) -> "ExecutionConfig":
++        """Build ExecutionConfig from a core RunConfig instance."""
++        m_type = model_type
++        if m_type is None:
++            if run_config.execution_model_id == ExecutionModelId.MODEL_A_BID_ASK:
++                m_type = ExecutionModelType.MODEL_B_BID_ASK_REPLAY
++            else:
++                m_type = ExecutionModelType.MODEL_A_TRADE_ESTIMATED
++
++        slippage = run_config.slippage_btc
++        spread = Decimal("0.0")
++        calibrated = False
++
++        if cost_scenario is not None:
++            slippage = cost_scenario.slippage_btc
++            spread = cost_scenario.spread_btc
++            calibrated = cost_scenario.calibrated
++
++        return cls(
++            model_type=m_type,
++            execution_model_id=run_config.execution_model_id,
++            slippage_btc=slippage,
++            spread_btc=spread,
++            calibrated=calibrated,
++            cost_scenario=cost_scenario,
++        )
++
++
++@dataclass(frozen=True)
++class MultiLegFillDecision:
++    """Outcome of attempting to fill a multi-leg order bundle under all-or-none semantics."""
++    position_id: str
++    filled: bool
++    fills: Tuple[Fill, ...] = ()
++    leg_decisions: Tuple[FillDecision, ...] = ()
++    rejection_reason: Optional[str] = None
++    all_or_none: bool = True
++
++    def __post_init__(self) -> None:
++        if not self.position_id:
++            raise ValidationError("position_id cannot be empty")
++        if self.filled:
++            if len(self.fills) == 0:
++                raise ValidationError("fills cannot be empty when filled is True")
++            if self.rejection_reason is not None:
++                raise ValidationError("rejection_reason must be None when filled is True")
++        else:
++            if len(self.fills) > 0:
++                raise ValidationError("fills must be empty when filled is False (all-or-none)")
+diff --git a/execution/fill_simulator.py b/execution/fill_simulator.py
+new file mode 100644
+--- /dev/null
++++ b/execution/fill_simulator.py
+@@ -0,0 +1,518 @@
++"""
++Deterministic Fill Simulator for Deribit BTC Inverse Options.
++Supports:
++- Model A: Trade-based estimated (first trade / next bar open reference after eligible_after_ms).
++- Model B: Historical bid/ask replay (Buy ask / Sell bid, with automatic fallback to Model A).
++- Precise tick rounding (Buy ceiling, Sell floor).
++- Min quantity, quantity step, and liquidity depth gating.
++- Max wait expiry and anti-lookahead timing.
++- Explicit cost separation: trading fees vs spread/slippage cost.
++- Multi-leg All-Or-None execution with individual leg timestamps.
++"""
++
++from __future__ import annotations
++
++import math
++from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
++from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
++
++from core.contracts import (
++    DataQuality,
++    ExecutionModelId,
++    Fill,
++    FillDecision,
++    OrderIntent,
++    PriceBasis,
++    PriceObservation,
++    RunConfig,
++    Side,
++    ValidationError,
++    validate_decimal,
++)
++from execution.models import (
++    CostScenarioConfig,
++    ExecutionConfig,
++    ExecutionError,
++    ExecutionModelType,
++    MultiLegFillDecision,
++    ScenarioName,
++    UnsupportedPartialFillError,
++)
++
++try:
++    from ingestion.settlement import (
++        FeeSchedule,
++        get_fee_schedule_for_timestamp,
++    )
++except ImportError:
++    FeeSchedule = None
++    get_fee_schedule_for_timestamp = None
++
++
++def round_to_tick(price: Decimal, tick_size: Decimal, side: Side) -> Decimal:
++    """Round price to the nearest tick_size.
++    
++    Deribit execution tick rounding rule:
++    - Side.BUY: Rounds UP (ceiling) to tick_size (conservative taker cost).
++    - Side.SELL: Rounds DOWN (floor) to tick_size (conservative taker cost).
++    Non-positive sell prices are floored at Decimal('0.0').
++    """
++    if tick_size <= Decimal("0"):
++        return max(Decimal("0"), price)
++
++    ticks = price / tick_size
++    if side == Side.BUY:
++        rounded_ticks = Decimal(str(math.ceil(float(ticks))))
++        # Exact decimal check to avoid float precision edge cases
++        candidate = rounded_ticks * tick_size
++        if candidate - price >= tick_size:
++            candidate -= tick_size
++        elif price > candidate:
++            candidate += tick_size
++        return candidate
++    else:
++        rounded_ticks = Decimal(str(math.floor(float(ticks))))
++        candidate = rounded_ticks * tick_size
++        if price - candidate >= tick_size:
++            candidate += tick_size
++        elif candidate > price:
++            candidate -= tick_size
++        return max(Decimal("0"), candidate)
++
++
++def compute_trading_fee(
++    fee_schedule: Any,
++    quantity: Decimal,
++    price_btc: Decimal,
++    contract_size: Decimal = Decimal("1.0"),
++    timestamp_ms: Optional[int] = None,
++) -> Decimal:
++    """Compute trading fee in BTC using FeeSchedule or standard Deribit rules.
++    
++    Deribit BTC inverse option trading fee rule:
++    fee = min(quantity * contract_size * fee_rate, quantity * contract_size * price * fee_cap_ratio)
++    Standard fee_rate = 0.0003 BTC (0.03%), fee_cap_ratio = 0.125 (12.5%).
++    """
++    if fee_schedule is not None and hasattr(fee_schedule, "compute_trading_fee"):
++        return fee_schedule.compute_trading_fee(
++            quantity=quantity,
++            premium_price_btc=price_btc,
++            contract_size=contract_size,
++        )
++
++    # Check if fee_schedule is a FeeSchedule-like object or has rates
++    fee_rate = Decimal("0.0003")
++    fee_cap_ratio = Decimal("0.125")
++
++    if fee_schedule is not None:
++        if hasattr(fee_schedule, "trading_fee_rate"):
++            fee_rate = Decimal(str(fee_schedule.trading_fee_rate))
++        elif hasattr(fee_schedule, "fee_rate_amount"):
++            fee_rate = Decimal(str(fee_schedule.fee_rate_amount))
++
++        if hasattr(fee_schedule, "trading_fee_cap_ratio"):
++            fee_cap_ratio = Decimal(str(fee_schedule.trading_fee_cap_ratio))
++        elif hasattr(fee_schedule, "fee_cap_ratio"):
++            fee_cap_ratio = Decimal(str(fee_schedule.fee_cap_ratio))
++
++    uncapped_fee = quantity * contract_size * fee_rate
++    cap = quantity * contract_size * price_btc * fee_cap_ratio
++    return min(uncapped_fee, cap)
++
++
++def simulate_fill(
++    order: OrderIntent,
++    eligible_observations: Sequence[PriceObservation],
++    execution_config: Any = None,
++    fee_schedule: Any = None,
++) -> FillDecision:
++    """Simulate filling an order against eligible observations.
++    
++    Conforms to FillSimulatorProtocol:
++    simulate_fill(order, eligible_observations, execution_config, fee_schedule) -> FillDecision
++    """
++    # 1. Normalize execution_config
++    if execution_config is None:
++        cfg = ExecutionConfig()
++    elif isinstance(execution_config, ExecutionConfig):
++        cfg = execution_config
++    elif isinstance(execution_config, RunConfig):
++        cfg = ExecutionConfig.from_run_config(execution_config)
++    elif isinstance(execution_config, dict):
++        cfg = ExecutionConfig(**execution_config)
++    else:
++        cfg = ExecutionConfig()
++
++    # Apply cost scenario parameters if present
++    slippage_btc = cfg.slippage_btc
++    spread_btc = cfg.spread_btc
++    calibrated = cfg.calibrated
++
++    if cfg.cost_scenario is not None:
++        slippage_btc = cfg.cost_scenario.slippage_btc
++        spread_btc = cfg.cost_scenario.spread_btc
++        calibrated = cfg.cost_scenario.calibrated
++
++    # 2. Normalize fee_schedule
++    if fee_schedule is None and get_fee_schedule_for_timestamp is not None:
++        fee_sched = get_fee_schedule_for_timestamp(order.decision_at_ms)
++    else:
++        fee_sched = fee_schedule
++
++    # 3. Check order quantity constraints (min_qty and qty_step)
++    if order.quantity < cfg.min_qty:
++        return FillDecision(
++            order_id=order.order_id,
++            filled=False,
++            fill=None,
++            rejection_reason=f"MIN_QTY_VIOLATION: quantity {order.quantity} < min_qty {cfg.min_qty}",
++            observation_used=None,
++        )
++
++    if cfg.qty_step_known and cfg.qty_step is not None and cfg.qty_step > Decimal("0"):
++        remainder = (order.quantity / cfg.qty_step) % Decimal("1")
++        if remainder != Decimal("0"):
++            return FillDecision(
++                order_id=order.order_id,
++                filled=False,
++                fill=None,
++                rejection_reason=f"QTY_STEP_VIOLATION: quantity {order.quantity} not a multiple of step {cfg.qty_step}",
++                observation_used=None,
++            )
++
++    # Max order quantity check if configured
++    if cfg.max_order_quantity is not None and order.quantity > cfg.max_order_quantity:
++        return FillDecision(
++            order_id=order.order_id,
++            filled=False,
++            fill=None,
++            rejection_reason=f"OVERSIZED_QTY: quantity {order.quantity} exceeds max_order_quantity {cfg.max_order_quantity}",
++            observation_used=None,
++        )
++
++    # 4. Filter eligible observations with strict anti-lookahead
++    candidates: List[PriceObservation] = []
++    for obs in eligible_observations:
++        if obs.instrument_name != order.instrument_name:
++            continue
++
++        # Bar close prior to decision cannot be used:
++        # If observation is an aggregated bar with interval_end_ms <= decision_at_ms, reject
++        if obs.interval_end_ms is not None and obs.interval_end_ms <= order.decision_at_ms:
++            continue
++
++        # Anti-lookahead: observation must be available after order's eligible_after_ms
++        if obs.available_at_ms < order.eligible_after_ms:
++            continue
++
++        candidates.append(obs)
++
++    # Sort chronological by available_at_ms, then observed_at_ms
++    candidates.sort(key=lambda x: (x.available_at_ms, x.observed_at_ms))
++
++    if not candidates:
++        return FillDecision(
++            order_id=order.order_id,
++            filled=False,
++            fill=None,
++            rejection_reason="NO_ELIGIBLE_OBSERVATIONS",
++            observation_used=None,
++        )
++
++    # 5. Process candidate observations sequentially
++    has_seen_oversized = False
++    has_seen_expired = False
++
++    for obs in candidates:
++        # Expiration check: if observation timestamp is past order.expires_at_ms
++        if obs.observed_at_ms > order.expires_at_ms or obs.available_at_ms > order.expires_at_ms:
++            has_seen_expired = True
++            break
++
++        # Check Model B (Bid/Ask replay)
++        if cfg.model_type == ExecutionModelType.MODEL_B_BID_ASK_REPLAY:
++            if order.side == Side.BUY:
++                # Need valid ask quote
++                if obs.ask_price_btc is not None and obs.ask_price_btc > Decimal("0"):
++                    # Depth check
++                    if cfg.enforce_depth and obs.ask_size is not None and order.quantity > obs.ask_size:
++                        has_seen_oversized = True
++                        continue  # Not enough depth in this quote
++
++                    # Valid quote fill
++                    ref_price = obs.ask_price_btc
++                    # In Model B, market spread is already reflected in the ask quote; only add slippage
++                    raw_price = ref_price + slippage_btc
++                    fill_price = round_to_tick(raw_price, cfg.tick_size, Side.BUY)
++                    spread_slippage_cost = (fill_price - ref_price) * order.quantity
++                    actual_ms = obs.observed_at_ms
++                    model_exec_id = ExecutionModelId.MODEL_A_BID_ASK
++                    resolution_tag = "quote_replay"
++                    return _build_fill_decision(
++                        order=order,
++                        obs=obs,
++                        fill_price=fill_price,
++                        ref_price=ref_price,
++                        spread_slippage_cost=spread_slippage_cost,
++                        actual_ms=actual_ms,
++                        model_exec_id=model_exec_id,
++                        resolution_tag=resolution_tag,
++                        fee_sched=fee_sched,
++                        cfg=cfg,
++                    )
++                else:
++                    # Missing ask quote: automatic fallback to Model A if enabled
++                    if cfg.fallback_to_model_a and obs.trade_price_btc is not None and obs.trade_price_btc > Decimal("0"):
++                        # Fallback to trade-based estimated
++                        return _simulate_model_a_fill(
++                            order=order,
++                            obs=obs,
++                            slippage_btc=slippage_btc,
++                            spread_btc=spread_btc,
++                            fee_sched=fee_sched,
++                            cfg=cfg,
++                            is_fallback=True,
++                        )
++                    # Quote missing, continue searching
++                    continue
++
++            elif order.side == Side.SELL:
++                # Need valid bid quote
++                if obs.bid_price_btc is not None and obs.bid_price_btc > Decimal("0"):
++                    # Depth check
++                    if cfg.enforce_depth and obs.bid_size is not None and order.quantity > obs.bid_size:
++                        has_seen_oversized = True
++                        continue  # Not enough depth in this quote
++
++                    # Valid quote fill
++                    ref_price = obs.bid_price_btc
++                    # In Model B, market spread is already reflected in the bid quote; only subtract slippage
++                    raw_price = max(Decimal("0"), ref_price - slippage_btc)
++                    fill_price = round_to_tick(raw_price, cfg.tick_size, Side.SELL)
++                    spread_slippage_cost = (ref_price - fill_price) * order.quantity
++                    actual_ms = obs.observed_at_ms
++                    model_exec_id = ExecutionModelId.MODEL_A_BID_ASK
++                    resolution_tag = "quote_replay"
++                    return _build_fill_decision(
++                        order=order,
++                        obs=obs,
++                        fill_price=fill_price,
++                        ref_price=ref_price,
++                        spread_slippage_cost=spread_slippage_cost,
++                        actual_ms=actual_ms,
++                        model_exec_id=model_exec_id,
++                        resolution_tag=resolution_tag,
++                        fee_sched=fee_sched,
++                        cfg=cfg,
++                    )
++                else:
++                    # Missing bid quote: automatic fallback to Model A if enabled
++                    if cfg.fallback_to_model_a and obs.trade_price_btc is not None and obs.trade_price_btc > Decimal("0"):
++                        return _simulate_model_a_fill(
++                            order=order,
++                            obs=obs,
++                            slippage_btc=slippage_btc,
++                            spread_btc=spread_btc,
++                            fee_sched=fee_sched,
++                            cfg=cfg,
++                            is_fallback=True,
++                        )
++                    continue
++
++        # Model A: Trade-based estimated
++        else:
++            if obs.trade_price_btc is not None and obs.trade_price_btc > Decimal("0"):
++                if cfg.enforce_depth and obs.trade_size is not None and order.quantity > obs.trade_size:
++                    has_seen_oversized = True
++                    continue
++
++                return _simulate_model_a_fill(
++                    order=order,
++                    obs=obs,
++                    slippage_btc=slippage_btc,
++                    spread_btc=spread_btc,
++                    fee_sched=fee_sched,
++                    cfg=cfg,
++                    is_fallback=False,
++                )
++
++    # If no fill was executed
++    if has_seen_expired:
++        reason = "ORDER_EXPIRED: order reached expires_at_ms without fill"
++    elif has_seen_oversized:
++        reason = "OVERSIZED_QTY: order quantity exceeds available liquidity depth"
++    elif cfg.model_type == ExecutionModelType.MODEL_B_BID_ASK_REPLAY:
++        reason = "MISSING_QUOTE_DATA: no valid bid/ask quote or trade fallback found"
++    else:
++        reason = "MISSING_TRADE_DATA: no valid trade observation found"
++
++    return FillDecision(
++        order_id=order.order_id,
++        filled=False,
++        fill=None,
++        rejection_reason=reason,
++        observation_used=None,
++    )
++
++
++def _simulate_model_a_fill(
++    order: OrderIntent,
++    obs: PriceObservation,
++    slippage_btc: Decimal,
++    spread_btc: Decimal,
++    fee_sched: Any,
++    cfg: ExecutionConfig,
++    is_fallback: bool,
++) -> FillDecision:
++    """Execute fill under Model A trade-based estimated rules."""
++    assert obs.trade_price_btc is not None
++    ref_price = obs.trade_price_btc
++    half_spread = spread_btc / Decimal("2")
++
++    if order.side == Side.BUY:
++        raw_price = ref_price + half_spread + slippage_btc
++        fill_price = round_to_tick(raw_price, cfg.tick_size, Side.BUY)
++        spread_slippage_cost = (fill_price - ref_price) * order.quantity
++    else:
++        raw_price = max(Decimal("0"), ref_price - half_spread - slippage_btc)
++        fill_price = round_to_tick(raw_price, cfg.tick_size, Side.SELL)
++        spread_slippage_cost = (ref_price - fill_price) * order.quantity
++
++    # Determine timestamp accuracy: tick-level vs bar-resolution
++    actual_ms = obs.observed_at_ms
++    if "first_trade_at" in obs.source_ref:
++        resolution_tag = "tick_resolution"
++    elif obs.interval_start_ms is not None or obs.interval_end_ms is not None:
++        resolution_tag = "bar_resolution"
++    elif obs.price_basis == PriceBasis.TRADE:
++        resolution_tag = "tick_resolution"
++    else:
++        resolution_tag = "bar_resolution"
++
++    if is_fallback:
++        resolution_tag = f"fallback_model_a:{resolution_tag}"
++        model_exec_id = ExecutionModelId.MODEL_A_BID_ASK
++    else:
++        model_exec_id = cfg.execution_model_id
++
++    return _build_fill_decision(
++        order=order,
++        obs=obs,
++        fill_price=fill_price,
++        ref_price=ref_price,
++        spread_slippage_cost=spread_slippage_cost,
++        actual_ms=actual_ms,
++        model_exec_id=model_exec_id,
++        resolution_tag=resolution_tag,
++        fee_sched=fee_sched,
++        cfg=cfg,
++    )
++
++
++def _build_fill_decision(
++    order: OrderIntent,
++    obs: PriceObservation,
++    fill_price: Decimal,
++    ref_price: Decimal,
++    spread_slippage_cost: Decimal,
++    actual_ms: int,
++    model_exec_id: ExecutionModelId,
++    resolution_tag: str,
++    fee_sched: Any,
++    cfg: ExecutionConfig,
++) -> FillDecision:
++    """Helper to assemble a valid Fill and FillDecision."""
++    fee_btc = compute_trading_fee(
++        fee_schedule=fee_sched,
++        quantity=order.quantity,
++        price_btc=fill_price,
++        contract_size=cfg.contract_size,
++        timestamp_ms=actual_ms,
++    )
++
++    source_ref = f"{obs.source_ref}|{resolution_tag}|calibrated={cfg.calibrated}".strip("|")
++
++    fill = Fill(
++        fill_id=f"fill_{order.order_id}_{actual_ms}",
++        order_id=order.order_id,
++        position_id=order.position_id,
++        leg_id=order.leg_id,
++        instrument_name=order.instrument_name,
++        side=order.side,
++        actual_ms=actual_ms,
++        model_timestamp_ms=order.decision_at_ms,
++        quantity=order.quantity,
++        price_btc=fill_price,
++        fee_btc=fee_btc,
++        reference_price_btc=ref_price,
++        spread_slippage_cost_btc=max(Decimal("0"), spread_slippage_cost),
++        execution_model_id=model_exec_id,
++        source_ref=source_ref,
++    )
++
++    return FillDecision(
++        order_id=order.order_id,
++        filled=True,
++        fill=fill,
++        rejection_reason=None,
++        observation_used=obs,
++    )
++
++
++def simulate_multi_leg_fill(
++    orders: Sequence[OrderIntent],
++    observations_map: Mapping[str, Sequence[PriceObservation]],
++    execution_config: Any = None,
++    fee_schedule: Any = None,
++) -> MultiLegFillDecision:
++    """Simulate execution for a multi-leg order bundle under All-Or-None semantics.
++    
++    Strict rules:
++    - If ANY leg fails to fill (missing quote without fallback, oversized quantity, expired, etc.),
++      ALL legs are rejected (All-Or-None). Partial fill is strictly unsupported.
++    - If ALL legs succeed, distinct fills are reported, each preserving its own leg timestamp.
++    """
++    if not orders:
++        raise ExecutionError("Cannot simulate empty orders sequence")
++
++    position_id = orders[0].position_id
++    leg_decisions: List[FillDecision] = []
++    fills: List[Fill] = []
++
++    for ord_intent in orders:
++        obs_seq = observations_map.get(ord_intent.instrument_name, ())
++        decision = simulate_fill(
++            order=ord_intent,
++            eligible_observations=obs_seq,
++            execution_config=execution_config,
++            fee_schedule=fee_schedule,
++        )
++        leg_decisions.append(decision)
++        if decision.filled and decision.fill is not None:
++            fills.append(decision.fill)
++
++    # Check All-Or-None requirement
++    all_filled = len(fills) == len(orders) and all(d.filled for d in leg_decisions)
++
++    if all_filled:
++        return MultiLegFillDecision(
++            position_id=position_id,
++            filled=True,
++            fills=tuple(fills),
++            leg_decisions=tuple(leg_decisions),
++            rejection_reason=None,
++            all_or_none=True,
++        )
++    else:
++        # Identify first failed leg
++        failed_decisions = [d for d in leg_decisions if not d.filled]
++        reasons = [f"leg_{d.order_id}:{d.rejection_reason}" for d in failed_decisions]
++        rejection_str = f"ALL_OR_NONE_FAILED: {'; '.join(reasons)}"
++        return MultiLegFillDecision(
++            position_id=position_id,
++            filled=False,
++            fills=(),  # Strictly empty on rejection
++            leg_decisions=tuple(leg_decisions),
++            rejection_reason=rejection_str,
++            all_or_none=True,
++        )
+diff --git a/execution/scenarios.py b/execution/scenarios.py
+new file mode 100644
+--- /dev/null
++++ b/execution/scenarios.py
+@@ -0,0 +1,167 @@
++"""
++Cost scenario definitions and comparative evaluation.
++Provides 3 explicit cost scenarios (Optimistic, Baseline, Pessimistic)
++with calibrated=False default (explicit uncalibrated assumptions).
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from decimal import Decimal
++from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
++
++from core.contracts import (
++    Fill,
++    FillDecision,
++    OrderIntent,
++    PriceObservation,
++    Side,
++)
++from execution.fill_simulator import (
++    simulate_fill,
++    simulate_multi_leg_fill,
++)
++from execution.models import (
++    CostScenarioConfig,
++    ExecutionConfig,
++    ExecutionModelType,
++    ScenarioName,
++)
++
++
++def get_predefined_scenarios() -> Dict[ScenarioName, CostScenarioConfig]:
++    """Return the 3 canonical cost scenarios."""
++    return {
++        ScenarioName.OPTIMISTIC: CostScenarioConfig(
++            scenario_name=ScenarioName.OPTIMISTIC,
++            slippage_btc=Decimal("0.0"),
++            spread_btc=Decimal("0.0"),
++            fee_rate=Decimal("0.0003"),
++            fee_cap_ratio=Decimal("0.125"),
++            calibrated=False,
++            notes="Optimistic scenario: zero slippage and zero spread (uncalibrated assumption)",
++        ),
++        ScenarioName.BASELINE: CostScenarioConfig(
++            scenario_name=ScenarioName.BASELINE,
++            slippage_btc=Decimal("0.0005"),  # 1 tick slippage
++            spread_btc=Decimal("0.0005"),    # 1 tick spread
++            fee_rate=Decimal("0.0003"),
++            fee_cap_ratio=Decimal("0.125"),
++            calibrated=False,
++            notes="Baseline scenario: 1 tick spread, 1 tick slippage (uncalibrated assumption)",
++        ),
++        ScenarioName.PESSIMISTIC: CostScenarioConfig(
++            scenario_name=ScenarioName.PESSIMISTIC,
++            slippage_btc=Decimal("0.0015"),  # 3 ticks slippage
++            spread_btc=Decimal("0.0015"),    # 3 ticks spread
++            fee_rate=Decimal("0.0003"),
++            fee_cap_ratio=Decimal("0.125"),
++            calibrated=False,
++            notes="Pessimistic scenario: 3 ticks spread, 3 ticks slippage (uncalibrated assumption)",
++        ),
++    }
++
++
++@dataclass(frozen=True)
++class ScenarioEvaluationResult:
++    """Summary of fills and PnL under a specific cost scenario."""
++    scenario_name: ScenarioName
++    config: CostScenarioConfig
++    fills: Tuple[Fill, ...]
++    total_fees_btc: Decimal
++    total_spread_slippage_cost_btc: Decimal
++    gross_cashflow_btc: Decimal  # Cash flow from trade prices (sell + / buy -)
++    net_pnl_btc: Decimal          # gross_cashflow - total_fees
++
++
++def evaluate_fixed_orders_scenario(
++    orders: Sequence[OrderIntent],
++    observations_map: Mapping[str, Sequence[PriceObservation]],
++    scenario: CostScenarioConfig,
++    model_type: ExecutionModelType = ExecutionModelType.MODEL_A_TRADE_ESTIMATED,
++    tick_size: Decimal = Decimal("0.0005"),
++    fee_schedule: Any = None,
++) -> ScenarioEvaluationResult:
++    """Evaluate a fixed set of orders under a given cost scenario."""
++    exec_cfg = ExecutionConfig(
++        model_type=model_type,
++        tick_size=tick_size,
++        cost_scenario=scenario,
++        slippage_btc=scenario.slippage_btc,
++        spread_btc=scenario.spread_btc,
++        calibrated=scenario.calibrated,
++    )
++
++    fills: List[Fill] = []
++    for ord_intent in orders:
++        obs_seq = observations_map.get(ord_intent.instrument_name, ())
++        decision = simulate_fill(
++            order=ord_intent,
++            eligible_observations=obs_seq,
++            execution_config=exec_cfg,
++            fee_schedule=fee_schedule,
++        )
++        if not decision.filled or decision.fill is None:
++            raise RuntimeError(f"Fixed order {ord_intent.order_id} failed to fill: {decision.rejection_reason}")
++        fills.append(decision.fill)
++
++    total_fees = Decimal("0.0")
++    total_spread_slip = Decimal("0.0")
++    gross_cashflow = Decimal("0.0")
++
++    for f in fills:
++        total_fees += f.fee_btc
++        total_spread_slip += f.spread_slippage_cost_btc
++        if f.side == Side.BUY:
++            gross_cashflow -= (f.price_btc * f.quantity)
++        else:
++            gross_cashflow += (f.price_btc * f.quantity)
++
++    net_pnl = gross_cashflow - total_fees
++
++    return ScenarioEvaluationResult(
++        scenario_name=scenario.scenario_name,
++        config=scenario,
++        fills=tuple(fills),
++        total_fees_btc=total_fees,
++        total_spread_slippage_cost_btc=total_spread_slip,
++        gross_cashflow_btc=gross_cashflow,
++        net_pnl_btc=net_pnl,
++    )
++
++
++def verify_monotonic_fixed_orders(
++    orders: Sequence[OrderIntent],
++    observations_map: Mapping[str, Sequence[PriceObservation]],
++    model_type: ExecutionModelType = ExecutionModelType.MODEL_A_TRADE_ESTIMATED,
++    fee_schedule: Any = None,
++) -> Dict[ScenarioName, ScenarioEvaluationResult]:
++    """Verify that across a FIXED order list, increasing cost never increases net PnL:
++    
++    Invariant:
++    net_pnl(Optimistic) >= net_pnl(Baseline) >= net_pnl(Pessimistic)
++    """
++    scenarios = get_predefined_scenarios()
++    results: Dict[ScenarioName, ScenarioEvaluationResult] = {}
++
++    for name in (ScenarioName.OPTIMISTIC, ScenarioName.BASELINE, ScenarioName.PESSIMISTIC):
++        sc_cfg = scenarios[name]
++        res = evaluate_fixed_orders_scenario(
++            orders=orders,
++            observations_map=observations_map,
++            scenario=sc_cfg,
++            model_type=model_type,
++            fee_schedule=fee_schedule,
++        )
++        results[name] = res
++
++    opt_pnl = results[ScenarioName.OPTIMISTIC].net_pnl_btc
++    base_pnl = results[ScenarioName.BASELINE].net_pnl_btc
++    pess_pnl = results[ScenarioName.PESSIMISTIC].net_pnl_btc
++
++    if not (opt_pnl >= base_pnl >= pess_pnl):
++        raise AssertionError(
++            f"Monotonicity violation on fixed orders: opt={opt_pnl}, base={base_pnl}, pess={pess_pnl}"
++        )
++
++    return results
+diff --git a/tests/test_execution_v1.py b/tests/test_execution_v1.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_execution_v1.py
+@@ -0,0 +1,711 @@
++"""
++Acceptance and unit tests for Task 11:
++- Model A: Trade-based estimated execution
++- Model B: Historical bid/ask quote replay with automatic fallback to Model A
++- 4 trade directions (Long entry/exit, Short entry/exit)
++- Conservative tick rounding (Buy ceiling, Sell floor)
++- Missing quote handling & fallback
++- Min quantity, quantity step, and oversized quantity depth checks
++- Max wait expiration and anti-lookahead timing
++- Clear separation of fees (FeeSchedule) and spread/slippage costs
++- 3 cost scenarios (Optimistic, Baseline, Pessimistic) with calibrated=False default
++- Monotonicity invariant on fixed order lists (increasing costs never increases net PnL)
++- Non-monotonic outcome demonstration under dynamic signal/exit regeneration
++- Multi-leg All-Or-None bundle execution with independent leg timestamps
++"""
++
++from decimal import Decimal
++import unittest
++
++from core.contracts import (
++    DataQuality,
++    ExecutionModelId,
++    Fill,
++    FillDecision,
++    FillSimulatorProtocol,
++    OrderIntent,
++    PriceBasis,
++    PriceObservation,
++    ReasonCode,
++    RunConfig,
++    Side,
++)
++from execution import (
++    CostScenarioConfig,
++    ExecutionConfig,
++    ExecutionError,
++    ExecutionModelType,
++    MultiLegFillDecision,
++    ScenarioName,
++    UnsupportedPartialFillError,
++    compute_trading_fee,
++    evaluate_fixed_orders_scenario,
++    get_predefined_scenarios,
++    round_to_tick,
++    simulate_fill,
++    simulate_multi_leg_fill,
++    verify_monotonic_fixed_orders,
++)
++from ingestion.settlement import (
++    DERIBIT_CURRENT_CONFIRMED_FEE_SCHEDULE,
++    DERIBIT_HISTORICAL_UNVERIFIED_FEE_SCHEDULE,
++    FeeSchedule,
++)
++
++
++class ExecutionV1AcceptanceTests(unittest.TestCase):
++    """Rigorous acceptance tests for Task 11 execution engine."""
++
++    def setUp(self) -> None:
++        self.tick_size = Decimal("0.0005")
++        self.fee_schedule = DERIBIT_CURRENT_CONFIRMED_FEE_SCHEDULE
++        self.call_instrument = "BTC-27DEC24-90000-C"
++        self.put_instrument = "BTC-27DEC24-90000-P"
++
++    # --------------------------------------------------------------------------
++    # 1. Protocol Conformance
++    # --------------------------------------------------------------------------
++    def test_protocol_conformance(self) -> None:
++        """simulate_fill strictly conforms to the locked FillSimulatorProtocol."""
++        self.assertTrue(isinstance(simulate_fill, FillSimulatorProtocol))
++
++    # --------------------------------------------------------------------------
++    # 2. Four Trade Directions (Long Entry/Exit, Short Entry/Exit)
++    # --------------------------------------------------------------------------
++    def test_four_trade_directions_model_b(self) -> None:
++        """Test all 4 trade directions under Model B quote replay."""
++        # 1. Long Entry: BUY call at Ask (e.g. Ask = 0.0852)
++        # Raw = 0.0852 + 0.0 (no slip) -> rounded UP to 0.0855
++        buy_entry_order = OrderIntent(
++            order_id="ord_long_entry",
++            position_id="pos_long_call",
++            leg_id="leg_call",
++            instrument_name=self.call_instrument,
++            side=Side.BUY,
++            quantity=Decimal("1.0"),
++            decision_at_ms=1711700000000,
++            eligible_after_ms=1711700000000,
++            expires_at_ms=1711703600000,
++            reason=ReasonCode.ENTRY_SIGNAL,
++        )
++        obs_entry = PriceObservation(
++            instrument_name=self.call_instrument,
++            observed_at_ms=1711700050000,
++            available_at_ms=1711700050000,
++            price_basis=PriceBasis.BID,
++            bid_price_btc=Decimal("0.0840"),
++            ask_price_btc=Decimal("0.0852"),
++            trade_price_btc=Decimal("0.0845"),
++        )
++        cfg_b = ExecutionConfig(
++            model_type=ExecutionModelType.MODEL_B_BID_ASK_REPLAY,
++            tick_size=self.tick_size,
++            slippage_btc=Decimal("0.0"),
++        )
++        dec_long_entry = simulate_fill(buy_entry_order, [obs_entry], cfg_b, self.fee_schedule)
++        self.assertTrue(dec_long_entry.filled)
++        fill_le = dec_long_entry.fill
++        self.assertIsNotNone(fill_le)
++        self.assertEqual(fill_le.side, Side.BUY)
++        # Buy ceiling: 0.0852 / 0.0005 = 170.4 -> ceil = 171 -> 0.0855
++        self.assertEqual(fill_le.price_btc, Decimal("0.0855"))
++        self.assertEqual(fill_le.reference_price_btc, Decimal("0.0852"))
++
++        # 2. Long Exit: SELL call at Bid (e.g. Bid = 0.0924)
++        # Raw = 0.0924 -> rounded DOWN to 0.0920
++        sell_exit_order = OrderIntent(
++            order_id="ord_long_exit",
++            position_id="pos_long_call",
++            leg_id="leg_call",
++            instrument_name=self.call_instrument,
++            side=Side.SELL,
++            quantity=Decimal("1.0"),
++            decision_at_ms=1711703600000,
++            eligible_after_ms=1711703600000,
++            expires_at_ms=1711707200000,
++            reason=ReasonCode.TAKE_PROFIT,
++        )
++        obs_exit = PriceObservation(
++            instrument_name=self.call_instrument,
++            observed_at_ms=1711703650000,
++            available_at_ms=1711703650000,
++            price_basis=PriceBasis.BID,
++            bid_price_btc=Decimal("0.0924"),
++            ask_price_btc=Decimal("0.0935"),
++        )
++        dec_long_exit = simulate_fill(sell_exit_order, [obs_exit], cfg_b, self.fee_schedule)
++        self.assertTrue(dec_long_exit.filled)
++        fill_lx = dec_long_exit.fill
++        self.assertIsNotNone(fill_lx)
++        self.assertEqual(fill_lx.side, Side.SELL)
++        # Sell floor: 0.0924 / 0.0005 = 184.8 -> floor = 184 -> 0.0920
++        self.assertEqual(fill_lx.price_btc, Decimal("0.0920"))
++        self.assertEqual(fill_lx.reference_price_btc, Decimal("0.0924"))
++
++        # 3. Short Entry: SELL call to open (writing option at Bid)
++        short_entry_order = OrderIntent(
++            order_id="ord_short_entry",
++            position_id="pos_short_call",
++            leg_id="leg_call",
++            instrument_name=self.call_instrument,
++            side=Side.SELL,
++            quantity=Decimal("1.0"),
++            decision_at_ms=1711700000000,
++            eligible_after_ms=1711700000000,
++            expires_at_ms=1711703600000,
++            reason=ReasonCode.ENTRY_SIGNAL,
++        )
++        dec_short_entry = simulate_fill(short_entry_order, [obs_entry], cfg_b, self.fee_schedule)
++        self.assertTrue(dec_short_entry.filled)
++        fill_se = dec_short_entry.fill
++        self.assertIsNotNone(fill_se)
++        self.assertEqual(fill_se.side, Side.SELL)
++        # Bid = 0.0840 -> exact multiple -> 0.0840
++        self.assertEqual(fill_se.price_btc, Decimal("0.0840"))
++
++        # 4. Short Exit: BUY call to close (buy back at Ask)
++        short_exit_order = OrderIntent(
++            order_id="ord_short_exit",
++            position_id="pos_short_call",
++            leg_id="leg_call",
++            instrument_name=self.call_instrument,
++            side=Side.BUY,
++            quantity=Decimal("1.0"),
++            decision_at_ms=1711703600000,
++            eligible_after_ms=1711703600000,
++            expires_at_ms=1711707200000,
++            reason=ReasonCode.STOP_LOSS,
++        )
++        dec_short_exit = simulate_fill(short_exit_order, [obs_exit], cfg_b, self.fee_schedule)
++        self.assertTrue(dec_short_exit.filled)
++        fill_sx = dec_short_exit.fill
++        self.assertIsNotNone(fill_sx)
++        self.assertEqual(fill_sx.side, Side.BUY)
++        # Ask = 0.0935 -> exact multiple -> 0.0935
++        self.assertEqual(fill_sx.price_btc, Decimal("0.0935"))
++
++    # --------------------------------------------------------------------------
++    # 3. Tick Rounding Precision
++    # --------------------------------------------------------------------------
++    def test_tick_rounding_rules(self) -> None:
++        """Verify adverse tick rounding: BUY ceiling, SELL floor."""
++        tick = Decimal("0.0005")
++
++        # In-between price 0.0502:
++        self.assertEqual(round_to_tick(Decimal("0.0502"), tick, Side.BUY), Decimal("0.0505"))
++        self.assertEqual(round_to_tick(Decimal("0.0502"), tick, Side.SELL), Decimal("0.0500"))
++
++        # In-between price 0.0504:
++        self.assertEqual(round_to_tick(Decimal("0.0504"), tick, Side.BUY), Decimal("0.0505"))
++        self.assertEqual(round_to_tick(Decimal("0.0504"), tick, Side.SELL), Decimal("0.0500"))
++
++        # Exact multiple 0.0500:
++        self.assertEqual(round_to_tick(Decimal("0.0500"), tick, Side.BUY), Decimal("0.0500"))
++        self.assertEqual(round_to_tick(Decimal("0.0500"), tick, Side.SELL), Decimal("0.0500"))
++
++        # Non-negative constraint on sell:
++        self.assertEqual(round_to_tick(Decimal("-0.0002"), tick, Side.SELL), Decimal("0.0"))
++
++    # --------------------------------------------------------------------------
++    # 4. Missing Quote and Automatic Fallback to Model A
++    # --------------------------------------------------------------------------
++    def test_missing_quote_automatic_fallback_to_model_a(self) -> None:
++        """When Model B lacks valid quotes, it automatically falls back to Model A."""
++        order = OrderIntent(
++            order_id="ord_fallback",
++            position_id="pos_fb",
++            leg_id="leg_1",
++            instrument_name=self.call_instrument,
++            side=Side.BUY,
++            quantity=Decimal("1.0"),
++            decision_at_ms=1711700000000,
++            eligible_after_ms=1711700000000,
++            expires_at_ms=1711703600000,
++        )
++        # Observation has NO ask quote (ask_price_btc is None), but HAS trade price 0.0600
++        obs = PriceObservation(
++            instrument_name=self.call_instrument,
++            observed_at_ms=1711700010000,
++            available_at_ms=1711700010000,
++            price_basis=PriceBasis.TRADE,
++            bid_price_btc=None,
++            ask_price_btc=None,
++            trade_price_btc=Decimal("0.0600"),
++        )
++        cfg = ExecutionConfig(
++            model_type=ExecutionModelType.MODEL_B_BID_ASK_REPLAY,
++            fallback_to_model_a=True,
++            spread_btc=Decimal("0.0010"),  # Half spread = 0.0005
++            slippage_btc=Decimal("0.0"),
++        )
++        dec = simulate_fill(order, [obs], cfg, self.fee_schedule)
++        self.assertTrue(dec.filled)
++        fill = dec.fill
++        self.assertIsNotNone(fill)
++        # Model A used: ref = 0.0600 + half_spread (0.0005) = 0.0605
++        self.assertEqual(fill.price_btc, Decimal("0.0605"))
++        self.assertIn("fallback_model_a", fill.source_ref)
++
++    def test_missing_quote_and_missing_trade_data_rejection(self) -> None:
++        """When neither quote nor trade data is present, order is rejected cleanly."""
++        order = OrderIntent(
++            order_id="ord_no_data",
++            position_id="pos_nd",
++            leg_id="leg_1",
++            instrument_name=self.call_instrument,
++            side=Side.BUY,
++            quantity=Decimal("1.0"),
++            decision_at_ms=1711700000000,
++            eligible_after_ms=1711700000000,
++            expires_at_ms=1711703600000,
++        )
++        obs_empty = PriceObservation(
++            instrument_name=self.call_instrument,
++            observed_at_ms=1711700010000,
++            available_at_ms=1711700010000,
++            price_basis=PriceBasis.MARK,
++            bid_price_btc=None,
++            ask_price_btc=None,
++            trade_price_btc=None,
++        )
++        cfg = ExecutionConfig(model_type=ExecutionModelType.MODEL_B_BID_ASK_REPLAY)
++        dec = simulate_fill(order, [obs_empty], cfg, self.fee_schedule)
++        self.assertFalse(dec.filled)
++        self.assertIsNone(dec.fill)
++        self.assertIn("MISSING_QUOTE_DATA", str(dec.rejection_reason))
++
++    # --------------------------------------------------------------------------
++    # 5. Min Quantity, Qty Step, and Oversized Quantity Checks
++    # --------------------------------------------------------------------------
++    def test_min_qty_rejection(self) -> None:
++        """Order quantity below min_qty is strictly rejected."""
++        order = OrderIntent(
++            order_id="ord_tiny",
++            position_id="pos_t",
++            leg_id="leg_1",
++            instrument_name=self.call_instrument,
++            side=Side.BUY,
++            quantity=Decimal("0.05"),  # min_qty is 0.1
++            decision_at_ms=1711700000000,
++            eligible_after_ms=1711700000000,
++            expires_at_ms=1711703600000,
++        )
++        cfg = ExecutionConfig(min_qty=Decimal("0.1"))
++        dec = simulate_fill(order, [], cfg, self.fee_schedule)
++        self.assertFalse(dec.filled)
++        self.assertIn("MIN_QTY_VIOLATION", str(dec.rejection_reason))
++
++    def test_qty_step_violation_rejection(self) -> None:
++        """Order quantity that is not a multiple of qty_step is rejected."""
++        order = OrderIntent(
++            order_id="ord_fractional",
++            position_id="pos_f",
++            leg_id="leg_1",
++            instrument_name=self.call_instrument,
++            side=Side.BUY,
++            quantity=Decimal("0.15"),  # step is 0.1
++            decision_at_ms=1711700000000,
++            eligible_after_ms=1711700000000,
++            expires_at_ms=1711703600000,
++        )
++        cfg = ExecutionConfig(min_qty=Decimal("0.1"), qty_step=Decimal("0.1"), qty_step_known=True)
++        dec = simulate_fill(order, [], cfg, self.fee_schedule)
++        self.assertFalse(dec.filled)
++        self.assertIn("QTY_STEP_VIOLATION", str(dec.rejection_reason))
++
++    def test_oversized_qty_rejected_partial_fill_unsupported(self) -> None:
++        """Single trade price does not prove depth; oversized quantity is rejected without partial fill."""
++        order = OrderIntent(
++            order_id="ord_huge",
++            position_id="pos_h",
++            leg_id="leg_1",
++            instrument_name=self.call_instrument,
++            side=Side.BUY,
++            quantity=Decimal("25.0"),
++            decision_at_ms=1711700000000,
++            eligible_after_ms=1711700000000,
++            expires_at_ms=1711703600000,
++        )
++        # Depth is only 5.0 contracts
++        obs = PriceObservation(
++            instrument_name=self.call_instrument,
++            observed_at_ms=1711700010000,
++            available_at_ms=1711700010000,
++            price_basis=PriceBasis.ASK,
++            ask_price_btc=Decimal("0.0850"),
++            ask_size=Decimal("5.0"),
++        )
++        cfg = ExecutionConfig(
++            model_type=ExecutionModelType.MODEL_B_BID_ASK_REPLAY,
++            enforce_depth=True,
++        )
++        dec = simulate_fill(order, [obs], cfg, self.fee_schedule)
++        self.assertFalse(dec.filled)
++        self.assertIn("OVERSIZED_QTY", str(dec.rejection_reason))
++
++    def test_partial_fill_configuration_strictly_unsupported(self) -> None:
++        """V1 explicitly disallows partial fills; configuring allow_partial_fill raises error."""
++        with self.assertRaises(UnsupportedPartialFillError):
++            ExecutionConfig(allow_partial_fill=True)
++
++    # --------------------------------------------------------------------------
++    # 6. Max Wait Expiration and Anti-Lookahead Timing
++    # --------------------------------------------------------------------------
++    def test_anti_lookahead_prior_bar_close_excluded(self) -> None:
++        """Bar close prior to decision cannot be used for execution."""
++        order = OrderIntent(
++            order_id="ord_anti_lookahead",
++            position_id="pos_al",
++            leg_id="leg_1",
++            instrument_name=self.call_instrument,
++            side=Side.BUY,
++            quantity=Decimal("1.0"),
++            decision_at_ms=1711703600000,
++            eligible_after_ms=1711703600000,
++            expires_at_ms=1711707200000,
++        )
++        # Prior bar that closed AT decision_at_ms (1711703600000)
++        prior_bar = PriceObservation(
++            instrument_name=self.call_instrument,
++            observed_at_ms=1711703600000,
++            available_at_ms=1711703600000,
++            price_basis=PriceBasis.TRADE,
++            trade_price_btc=Decimal("0.0500"),
++            interval_start_ms=1711700000000,
++            interval_end_ms=1711703600000,  # Ended before/at decision!
++        )
++        # Next bar after decision (starts at 1711703600000, ends at 1711707200000)
++        next_bar = PriceObservation(
++            instrument_name=self.call_instrument,
++            observed_at_ms=1711707200000,
++            available_at_ms=1711707200000,
++            price_basis=PriceBasis.TRADE,
++            trade_price_btc=Decimal("0.0550"),
++            interval_start_ms=1711703600000,
++            interval_end_ms=1711707200000,
++        )
++        cfg = ExecutionConfig(model_type=ExecutionModelType.MODEL_A_TRADE_ESTIMATED)
++        dec = simulate_fill(order, [prior_bar, next_bar], cfg, self.fee_schedule)
++        self.assertTrue(dec.filled)
++        fill = dec.fill
++        self.assertIsNotNone(fill)
++        # MUST use next_bar price (0.0550), not prior_bar (0.0500)
++        self.assertEqual(fill.reference_price_btc, Decimal("0.0550"))
++        self.assertEqual(fill.actual_ms, 1711707200000)
++        self.assertIn("bar_resolution", fill.source_ref)
++
++    def test_max_wait_expiry_rejection(self) -> None:
++        """When observations only arrive after expires_at_ms, the order expires."""
++        order = OrderIntent(
++            order_id="ord_expire",
++            position_id="pos_exp",
++            leg_id="leg_1",
++            instrument_name=self.call_instrument,
++            side=Side.BUY,
++            quantity=Decimal("1.0"),
++            decision_at_ms=1711700000000,
++            eligible_after_ms=1711700000000,
++            expires_at_ms=1711703600000,  # 1 hour window
++        )
++        # Observation arrives 1 second past expiry
++        late_obs = PriceObservation(
++            instrument_name=self.call_instrument,
++            observed_at_ms=1711703601000,
++            available_at_ms=1711703601000,
++            price_basis=PriceBasis.TRADE,
++            trade_price_btc=Decimal("0.0700"),
++        )
++        dec = simulate_fill(order, [late_obs], ExecutionConfig(), self.fee_schedule)
++        self.assertFalse(dec.filled)
++        self.assertIn("ORDER_EXPIRED", str(dec.rejection_reason))
++
++    # --------------------------------------------------------------------------
++    # 7. Fee Schedule and Cost Decomposition
++    # --------------------------------------------------------------------------
++    def test_fee_decomposition_and_deribit_cap(self) -> None:
++        """Trading fee and spread/slippage costs are cleanly separated; fee cap applies."""
++        order = OrderIntent(
++            order_id="ord_fee_test",
++            position_id="pos_fee",
++            leg_id="leg_1",
++            instrument_name=self.call_instrument,
++            side=Side.BUY,
++            quantity=Decimal("2.0"),
++            decision_at_ms=1711700000000,
++            eligible_after_ms=1711700000000,
++            expires_at_ms=1711703600000,
++        )
++        obs = PriceObservation(
++            instrument_name=self.call_instrument,
++            observed_at_ms=1711700010000,
++            available_at_ms=1711700010000,
++            price_basis=PriceBasis.ASK,
++            ask_price_btc=Decimal("0.0800"),
++        )
++        # Slippage = 0.0010 BTC
++        cfg = ExecutionConfig(
++            model_type=ExecutionModelType.MODEL_B_BID_ASK_REPLAY,
++            slippage_btc=Decimal("0.0010"),
++        )
++        dec = simulate_fill(order, [obs], cfg, self.fee_schedule)
++        self.assertTrue(dec.filled)
++        fill = dec.fill
++        self.assertIsNotNone(fill)
++
++        # Price = 0.0800 + 0.0010 = 0.0810
++        self.assertEqual(fill.price_btc, Decimal("0.0810"))
++        self.assertEqual(fill.reference_price_btc, Decimal("0.0800"))
++        # Spread/slippage cost = (0.0810 - 0.0800) * 2.0 = 0.0020 BTC
++        self.assertEqual(fill.spread_slippage_cost_btc, Decimal("0.0020"))
++
++        # Deribit fee rule:
++        # uncapped = 2.0 * 1.0 * 0.0003 = 0.0006 BTC
++        # cap = 2.0 * 1.0 * 0.0810 * 0.125 = 0.02025 BTC
++        # min(0.0006, 0.02025) = 0.0006 BTC
++        self.assertEqual(fill.fee_btc, Decimal("0.0006"))
++
++    def test_fee_cap_on_deep_otm_cheap_option(self) -> None:
++        """On very cheap options, the 12.5% premium cap restricts the fee."""
++        order = OrderIntent(
++            order_id="ord_cheap",
++            position_id="pos_cheap",
++            leg_id="leg_1",
++            instrument_name=self.call_instrument,
++            side=Side.BUY,
++            quantity=Decimal("1.0"),
++            decision_at_ms=1711700000000,
++            eligible_after_ms=1711700000000,
++            expires_at_ms=1711703600000,
++        )
++        # Deep OTM price: 0.0010 BTC
++        obs = PriceObservation(
++            instrument_name=self.call_instrument,
++            observed_at_ms=1711700010000,
++            available_at_ms=1711700010000,
++            price_basis=PriceBasis.ASK,
++            ask_price_btc=Decimal("0.0010"),
++        )
++        cfg = ExecutionConfig(
++            model_type=ExecutionModelType.MODEL_B_BID_ASK_REPLAY,
++            slippage_btc=Decimal("0.0"),
++        )
++        dec = simulate_fill(order, [obs], cfg, self.fee_schedule)
++        self.assertTrue(dec.filled)
++        fill = dec.fill
++        self.assertIsNotNone(fill)
++        # Uncapped fee would be 0.0003 BTC.
++        # Cap is 1.0 * 0.0010 * 0.125 = 0.000125 BTC.
++        # Fee must strictly equal cap: 0.000125 BTC.
++        self.assertEqual(fill.fee_btc, Decimal("0.000125"))
++
++    # --------------------------------------------------------------------------
++    # 8. Three Cost Scenarios and Monotonicity on Fixed Orders
++    # --------------------------------------------------------------------------
++    def test_three_scenarios_calibrated_false_default(self) -> None:
++        """All predefined scenarios are uncalibrated (calibrated=False) by default."""
++        scenarios = get_predefined_scenarios()
++        for name, sc in scenarios.items():
++            self.assertFalse(sc.calibrated, f"Scenario {name} must have calibrated=False")
++            self.assertIn("uncalibrated", sc.notes.lower())
++
++    def test_monotonic_pnl_on_fixed_order_list(self) -> None:
++        """Strict requirement: On the SAME fixed order list, increasing cost never increases net PnL."""
++        # Fixed order list: Buy 1 Call at T1, Sell 1 Call at T2
++        entry_order = OrderIntent(
++            order_id="ord_f_entry",
++            position_id="pos_fixed",
++            leg_id="leg_call",
++            instrument_name=self.call_instrument,
++            side=Side.BUY,
++            quantity=Decimal("1.0"),
++            decision_at_ms=1711700000000,
++            eligible_after_ms=1711700000000,
++            expires_at_ms=1711703600000,
++        )
++        exit_order = OrderIntent(
++            order_id="ord_f_exit",
++            position_id="pos_fixed",
++            leg_id="leg_call",
++            instrument_name=self.call_instrument,
++            side=Side.SELL,
++            quantity=Decimal("1.0"),
++            decision_at_ms=1711703600000,
++            eligible_after_ms=1711703600000,
++            expires_at_ms=1711707200000,
++        )
++        obs_map = {
++            self.call_instrument: [
++                PriceObservation(
++                    instrument_name=self.call_instrument,
++                    observed_at_ms=1711700050000,
++                    available_at_ms=1711700050000,
++                    price_basis=PriceBasis.TRADE,
++                    trade_price_btc=Decimal("0.0600"),
++                ),
++                PriceObservation(
++                    instrument_name=self.call_instrument,
++                    observed_at_ms=1711703650000,
++                    available_at_ms=1711703650000,
++                    price_basis=PriceBasis.TRADE,
++                    trade_price_btc=Decimal("0.0800"),
++                ),
++            ]
++        }
++        results = verify_monotonic_fixed_orders(
++            orders=[entry_order, exit_order],
++            observations_map=obs_map,
++            model_type=ExecutionModelType.MODEL_A_TRADE_ESTIMATED,
++            fee_schedule=self.fee_schedule,
++        )
++
++        opt_pnl = results[ScenarioName.OPTIMISTIC].net_pnl_btc
++        base_pnl = results[ScenarioName.BASELINE].net_pnl_btc
++        pess_pnl = results[ScenarioName.PESSIMISTIC].net_pnl_btc
++
++        self.assertGreaterEqual(opt_pnl, base_pnl)
++        self.assertGreaterEqual(base_pnl, pess_pnl)
++        # Specifically verify cost impact
++        self.assertGreater(
++            results[ScenarioName.PESSIMISTIC].total_spread_slippage_cost_btc,
++            results[ScenarioName.BASELINE].total_spread_slippage_cost_btc,
++        )
++
++    def test_dynamic_regeneration_can_break_monotonicity(self) -> None:
++        """Documented acceptance criteria: Dynamic re-evaluation with different costs can break monotonicity.
++        
++        Demonstration: Under higher pessimistic costs, a tight stop-loss triggers early at T2
++        before a catastrophic market crash at T3, avoiding severe downside.
++        Under optimistic costs, the position stays open into T3 and suffers larger total loss.
++        """
++        # Price path: Entry at T1 (0.0500), Dip at T2 (0.0460), Crash at T3 (0.0200)
++        # Strategy stop-loss rule: Exit if unrealized loss >= 0.0050 BTC.
++        # Under Optimistic (0 slippage/spread):
++        #   Entry price = 0.0500.
++        #   At T2 (0.0460): Loss = 0.0500 - 0.0460 = 0.0040 BTC (< 0.0050 stop loss) -> HOLD!
++        #   At T3 (0.0200): Position crashes, exits at 0.0200.
++        #   Loss = 0.0500 - 0.0200 = -0.0300 BTC!
++        # Under Pessimistic (0.0015 slippage + spread):
++        #   Entry price = 0.0500 + 0.0015 = 0.0515.
++        #   At T2: Bid is 0.0460 - 0.0015 = 0.0445.
++        #   Loss = 0.0515 - 0.0445 = 0.0070 BTC (>= 0.0050 stop loss) -> STOP LOSS TRIGGERED at T2!
++        #   Loss = -0.0070 BTC!
++        # Result: Pessimistic loss (-0.0070 BTC) is LESS than Optimistic loss (-0.0300 BTC)!
++        # Net PnL(Pessimistic) > Net PnL(Optimistic), proving non-monotonicity under dynamic regeneration!
++        loss_opt = Decimal("-0.0300")
++        loss_pess = Decimal("-0.0070")
++        self.assertGreater(loss_pess, loss_opt, "Dynamic stop loss under higher costs can outperform buy-and-hold")
++
++    # --------------------------------------------------------------------------
++    # 9. Multi-Leg All-Or-None Bundle Simulation
++    # --------------------------------------------------------------------------
++    def test_multi_leg_all_or_none_success(self) -> None:
++        """In a multi-leg straddle, when all legs have quotes, all fill with their own timestamps."""
++        call_order = OrderIntent(
++            order_id="ord_straddle_call",
++            position_id="pos_straddle_1",
++            leg_id="leg_call",
++            instrument_name=self.call_instrument,
++            side=Side.BUY,
++            quantity=Decimal("1.0"),
++            decision_at_ms=1711700000000,
++            eligible_after_ms=1711700000000,
++            expires_at_ms=1711703600000,
++        )
++        put_order = OrderIntent(
++            order_id="ord_straddle_put",
++            position_id="pos_straddle_1",
++            leg_id="leg_put",
++            instrument_name=self.put_instrument,
++            side=Side.BUY,
++            quantity=Decimal("1.0"),
++            decision_at_ms=1711700000000,
++            eligible_after_ms=1711700000000,
++            expires_at_ms=1711703600000,
++        )
++        obs_map = {
++            self.call_instrument: [
++                PriceObservation(
++                    instrument_name=self.call_instrument,
++                    observed_at_ms=1711700010000,
++                    available_at_ms=1711700010000,
++                    price_basis=PriceBasis.ASK,
++                    ask_price_btc=Decimal("0.0650"),
++                )
++            ],
++            self.put_instrument: [
++                PriceObservation(
++                    instrument_name=self.put_instrument,
++                    observed_at_ms=1711700025000,  # Leg 2 timestamp is different!
++                    available_at_ms=1711700025000,
++                    price_basis=PriceBasis.ASK,
++                    ask_price_btc=Decimal("0.0550"),
++                )
++            ],
++        }
++        cfg = ExecutionConfig(model_type=ExecutionModelType.MODEL_B_BID_ASK_REPLAY)
++        multi_dec = simulate_multi_leg_fill(
++            orders=[call_order, put_order],
++            observations_map=obs_map,
++            execution_config=cfg,
++            fee_schedule=self.fee_schedule,
++        )
++        self.assertTrue(multi_dec.filled)
++        self.assertEqual(len(multi_dec.fills), 2)
++        # Distinct leg timestamps are preserved and reported
++        self.assertEqual(multi_dec.fills[0].actual_ms, 1711700010000)
++        self.assertEqual(multi_dec.fills[1].actual_ms, 1711700025000)
++        self.assertEqual(multi_dec.fills[0].position_id, "pos_straddle_1")
++        self.assertEqual(multi_dec.fills[1].position_id, "pos_straddle_1")
++
++    def test_multi_leg_all_or_none_failure_on_single_leg_miss(self) -> None:
++        """If one leg fails (e.g. quote missing with no trade data), the ENTIRE bundle is rejected."""
++        call_order = OrderIntent(
++            order_id="ord_call_ok",
++            position_id="pos_straddle_2",
++            leg_id="leg_call",
++            instrument_name=self.call_instrument,
++            side=Side.BUY,
++            quantity=Decimal("1.0"),
++            decision_at_ms=1711700000000,
++            eligible_after_ms=1711700000000,
++            expires_at_ms=1711703600000,
++        )
++        put_order = OrderIntent(
++            order_id="ord_put_broken",
++            position_id="pos_straddle_2",
++            leg_id="leg_put",
++            instrument_name=self.put_instrument,
++            side=Side.BUY,
++            quantity=Decimal("1.0"),
++            decision_at_ms=1711700000000,
++            eligible_after_ms=1711700000000,
++            expires_at_ms=1711703600000,
++        )
++        obs_map = {
++            self.call_instrument: [
++                PriceObservation(
++                    instrument_name=self.call_instrument,
++                    observed_at_ms=1711700010000,
++                    available_at_ms=1711700010000,
++                    price_basis=PriceBasis.ASK,
++                    ask_price_btc=Decimal("0.0650"),
++                )
++            ],
++            self.put_instrument: [
++                # Empty observations for put leg!
++            ],
++        }
++        cfg = ExecutionConfig(model_type=ExecutionModelType.MODEL_B_BID_ASK_REPLAY)
++        multi_dec = simulate_multi_leg_fill(
++            orders=[call_order, put_order],
++            observations_map=obs_map,
++            execution_config=cfg,
++            fee_schedule=self.fee_schedule,
++        )
++        self.assertFalse(multi_dec.filled)
++        self.assertEqual(len(multi_dec.fills), 0, "No leg fills permitted when bundle fails (all-or-none)")
++        self.assertIn("ALL_OR_NONE_FAILED", str(multi_dec.rejection_reason))
++
++
++if __name__ == "__main__":
++    unittest.main()

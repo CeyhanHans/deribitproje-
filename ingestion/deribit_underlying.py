@@ -13,7 +13,8 @@ import json
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Mapping, Sequence
+import math
+from typing import Any, Iterable, Mapping, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -352,3 +353,145 @@ def write_underlying_bars_json(path: Path, bars: Sequence[HourlyUnderlyingBar]) 
         ],
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+@dataclass(frozen=True)
+class UnderlyingCoverageReport:
+    start_timestamp: int
+    end_timestamp: int
+    step_ms: int
+    expected_intervals: int
+    observed_intervals: int
+    missing_intervals_count: int
+    coverage_ratio: float
+    missing_intervals: tuple[tuple[int, int], ...]
+
+
+def merge_and_dedup_bars(
+    bars_or_chunks: Sequence[HourlyUnderlyingBar] | Sequence[Sequence[HourlyUnderlyingBar]] | Iterable[Sequence[HourlyUnderlyingBar]],
+) -> tuple[HourlyUnderlyingBar, ...]:
+    """Merge multiple underlying bar sequences or a single sequence, deduplicating by timestamp_ms.
+
+    Validates data consistency: raises DeribitUnderlyingError if conflicting OHLC
+    data exists for the same timestamp.
+    Returns bars sorted ascending by timestamp_ms.
+    """
+    flat_bars: list[HourlyUnderlyingBar] = []
+    for item in bars_or_chunks:
+        if isinstance(item, HourlyUnderlyingBar):
+            flat_bars.append(item)
+        elif isinstance(item, (list, tuple)):
+            for sub_item in item:
+                if not isinstance(sub_item, HourlyUnderlyingBar):
+                    raise DeribitUnderlyingError(f"expected HourlyUnderlyingBar, got {type(sub_item).__name__}")
+                flat_bars.append(sub_item)
+        else:
+            raise DeribitUnderlyingError(f"expected HourlyUnderlyingBar or sequence, got {type(item).__name__}")
+
+    by_ts: dict[int, HourlyUnderlyingBar] = {}
+    for bar in flat_bars:
+        ts = bar.timestamp_ms
+        if ts in by_ts:
+            existing = by_ts[ts]
+            if (
+                abs(existing.open - bar.open) > 1e-4
+                or abs(existing.high - bar.high) > 1e-4
+                or abs(existing.low - bar.low) > 1e-4
+                or abs(existing.close - bar.close) > 1e-4
+            ):
+                raise DeribitUnderlyingError(
+                    f"conflicting underlying bar data at timestamp {ts}: "
+                    f"existing=(O={existing.open}, H={existing.high}, L={existing.low}, C={existing.close}) vs "
+                    f"new=(O={bar.open}, H={bar.high}, L={bar.low}, C={bar.close})"
+                )
+            continue
+        by_ts[ts] = bar
+
+    return tuple(by_ts[ts] for ts in sorted(by_ts.keys()))
+
+
+def find_missing_underlying_intervals(
+    bars: Sequence[HourlyUnderlyingBar],
+    start_timestamp: int,
+    end_timestamp: int,
+    step_ms: int = HOUR_MS,
+) -> tuple[tuple[int, int], ...]:
+    """Find contiguous expected intervals missing from the observed underlying bars.
+
+    Returns tuple of (interval_start_ms, interval_end_ms).
+    """
+    if start_timestamp < 0 or end_timestamp < 0:
+        raise ValueError("timestamps must be non-negative")
+    if start_timestamp >= end_timestamp:
+        raise ValueError("start_timestamp must be before end_timestamp")
+    if step_ms <= 0:
+        raise ValueError("step_ms must be positive")
+
+    present_ts = {b.timestamp_ms for b in bars}
+    missing: list[tuple[int, int]] = []
+    cursor = start_timestamp
+    while cursor < end_timestamp:
+        interval_end = min(cursor + step_ms, end_timestamp)
+        if cursor not in present_ts:
+            missing.append((cursor, interval_end))
+        cursor += step_ms
+
+    return tuple(missing)
+
+
+def compute_underlying_coverage(
+    bars: Sequence[HourlyUnderlyingBar],
+    start_timestamp: int,
+    end_timestamp: int,
+    step_ms: int = HOUR_MS,
+) -> UnderlyingCoverageReport:
+    """Compute coverage ratio and missing intervals report for an underlying series."""
+    missing = find_missing_underlying_intervals(
+        bars, start_timestamp, end_timestamp, step_ms=step_ms
+    )
+    expected = (end_timestamp - start_timestamp + step_ms - 1) // step_ms
+    missing_count = len(missing)
+    observed = max(0, expected - missing_count)
+    ratio = round(float(observed) / float(expected), 6) if expected > 0 else 1.0
+
+    return UnderlyingCoverageReport(
+        start_timestamp=start_timestamp,
+        end_timestamp=end_timestamp,
+        step_ms=step_ms,
+        expected_intervals=expected,
+        observed_intervals=observed,
+        missing_intervals_count=missing_count,
+        coverage_ratio=ratio,
+        missing_intervals=missing,
+    )
+
+
+def fetch_underlying_series(
+    start_timestamp: int,
+    end_timestamp: int,
+    *,
+    instrument_name: str = DEFAULT_INSTRUMENT,
+    index_name: str = DEFAULT_INDEX_NAME,
+    series_type: str = DEFAULT_SERIES_TYPE,
+    resolution: str = DEFAULT_RESOLUTION,
+    base_url: str = DEFAULT_BASE_URL,
+    max_hours: int = MAX_HOURS_PER_REQUEST,
+) -> tuple[HourlyUnderlyingBar, ...]:
+    """Fetch multi-chunk underlying bars, automatically merging and deduplicating them."""
+    requests = plan_underlying_requests(
+        start_timestamp=start_timestamp,
+        end_timestamp=end_timestamp,
+        instrument_name=instrument_name,
+        index_name=index_name,
+        series_type=series_type,
+        resolution=resolution,
+        base_url=base_url,
+        max_hours=max_hours,
+    )
+    chunk_results: list[tuple[HourlyUnderlyingBar, ...]] = []
+    for req in requests:
+        bars = fetch_underlying_bars(req)
+        chunk_results.append(bars)
+
+    return merge_and_dedup_bars(chunk_results)
+

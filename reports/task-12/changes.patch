@@ -1,0 +1,1626 @@
+diff --git a/portfolio/__init__.py b/portfolio/__init__.py
+new file mode 100644
+--- /dev/null
++++ b/portfolio/__init__.py
+@@ -0,0 +1,47 @@
++"""
++Portfolio package for Deribit BTC Inverse Options Backtest Catalog.
++Provides double-entry cash ledger, position management, margin stress reserves,
++settlement processing, and valuation accounting conforming to schema 1.0.
++"""
++
++from portfolio.ledger import (
++    apply_fill,
++    make_instrument,
++)
++from portfolio.models import (
++    DuplicateFillError,
++    InsufficientCapitalError,
++    MarginModelConfig,
++    PortfolioError,
++    RiskBreach,
++    SettlementError,
++    ShortPositionRejectedError,
++)
++from portfolio.settlement_service import (
++    compute_delivery_fee,
++    settle,
++)
++from portfolio.valuation import (
++    AccountingMetricsSummary,
++    check_risk_breaches,
++    compute_accounting_summary,
++    evaluate_equity,
++)
++
++__all__ = [
++    "apply_fill",
++    "settle",
++    "make_instrument",
++    "evaluate_equity",
++    "check_risk_breaches",
++    "compute_accounting_summary",
++    "compute_delivery_fee",
++    "AccountingMetricsSummary",
++    "MarginModelConfig",
++    "RiskBreach",
++    "PortfolioError",
++    "InsufficientCapitalError",
++    "ShortPositionRejectedError",
++    "DuplicateFillError",
++    "SettlementError",
++]
+diff --git a/portfolio/models.py b/portfolio/models.py
+new file mode 100644
+--- /dev/null
++++ b/portfolio/models.py
+@@ -0,0 +1,96 @@
++"""
++Portfolio and ledger models, exceptions, and margin configurations.
++Schema Version: 1.0
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from decimal import Decimal
++from typing import Optional
++
++from core.contracts import (
++    validate_decimal,
++    validate_not_bool,
++    validate_timestamp_ms,
++)
++
++
++class PortfolioError(Exception):
++    """Base exception for portfolio and accounting errors."""
++    pass
++
++
++class InsufficientCapitalError(PortfolioError):
++    """Raised when available cash is insufficient for premium, fees, or margin reserves."""
++    pass
++
++
++class ShortPositionRejectedError(PortfolioError):
++    """Raised when a short position is attempted without an explicit margin model."""
++    pass
++
++
++class DuplicateFillError(PortfolioError):
++    """Raised when a fill has already been processed and cannot be re-applied."""
++    pass
++
++
++class SettlementError(PortfolioError):
++    """Raised when settlement encounters invalid contract or payoff state."""
++    pass
++
++
++@dataclass(frozen=True)
++class MarginModelConfig:
++    """Margin and stress reserve configuration for short options.
++    
++    Invariants:
++    - exchange_margin_equivalent is strictly False for V1 (documented conservative model,
++      not an official Deribit exchange margin calculation).
++    - allow_naked_short defaults to False.
++    """
++    model_name: str = "conservative_stress_reserve"
++    stress_reserve_ratio: Decimal = Decimal("0.5")
++    exchange_margin_equivalent: bool = False
++    allow_naked_short: bool = False
++    notes: str = "V1 conservative stress reserve model (not exchange margin equivalent)"
++
++    def __post_init__(self) -> None:
++        if not self.model_name:
++            raise ValueError("model_name cannot be empty")
++        validate_decimal(self.stress_reserve_ratio, "stress_reserve_ratio", non_negative=True)
++        validate_not_bool(self.stress_reserve_ratio, "stress_reserve_ratio")
++        if not isinstance(self.exchange_margin_equivalent, bool):
++            raise ValueError("exchange_margin_equivalent must be a boolean")
++        if not isinstance(self.allow_naked_short, bool):
++            raise ValueError("allow_naked_short must be a boolean")
++
++
++@dataclass(frozen=True)
++class RiskBreach:
++    """Documented record of a margin or stress reserve risk breach.
++    
++    Strict rule: If liabilities exceed allocated stress reserves, report
++    a risk breach. Do NOT invent a fake liquidation order.
++    """
++    timestamp_ms: int
++    position_id: str
++    instrument_name: str
++    liability_btc: Decimal
++    reserved_btc: Decimal
++    underlying_price_usd: Decimal
++    is_breached: bool = True
++    message: str = ""
++
++    def __post_init__(self) -> None:
++        validate_timestamp_ms(self.timestamp_ms, "timestamp_ms")
++        if not self.position_id:
++            raise ValueError("position_id cannot be empty")
++        if not self.instrument_name:
++            raise ValueError("instrument_name cannot be empty")
++        validate_decimal(self.liability_btc, "liability_btc", non_negative=True)
++        validate_decimal(self.reserved_btc, "reserved_btc", non_negative=True)
++        validate_decimal(self.underlying_price_usd, "underlying_price_usd", strictly_positive=True)
++        if not isinstance(self.is_breached, bool):
++            raise ValueError("is_breached must be a boolean")
+diff --git a/portfolio/ledger.py b/portfolio/ledger.py
+new file mode 100644
+--- /dev/null
++++ b/portfolio/ledger.py
+@@ -0,0 +1,470 @@
++"""
++Portfolio cash ledger, transaction processing, and fill application.
++Implements FillApplicatorProtocol conforming to schema 1.0.
++"""
++
++from __future__ import annotations
++
++from decimal import Decimal
++from typing import Mapping, Optional, Sequence, Tuple
++
++from core.contracts import (
++    Currency,
++    EntryType,
++    Fill,
++    FillApplicatorProtocol,
++    Instrument,
++    LedgerEntry,
++    OptionType,
++    PortfolioState,
++    Position,
++    PositionStatus,
++    ReasonCode,
++    Side,
++    validate_decimal,
++)
++from portfolio.models import (
++    DuplicateFillError,
++    InsufficientCapitalError,
++    MarginModelConfig,
++    ShortPositionRejectedError,
++)
++
++CONTRACT_SIZE_BTC = Decimal("1.0")
++
++
++def parse_instrument_metadata(name: str) -> Tuple[OptionType, Decimal, int]:
++    """Parse option_type, strike_usd, and expiry_ms from Deribit instrument name.
++    
++    Format: BTC-{DDMMMYY}-{STRIKE}-{C|P} e.g. BTC-27DEC24-90000-C
++    """
++    parts = name.split("-")
++    if len(parts) >= 4:
++        strike = Decimal(parts[2])
++        opt_type = OptionType.CALL if parts[3].upper().startswith("C") else OptionType.PUT
++        return opt_type, strike, 0
++    return OptionType.CALL, Decimal("100000"), 0
++
++
++def make_instrument(
++    name: str,
++    contract_size: Decimal = CONTRACT_SIZE_BTC,
++    creation_ms: int = 0,
++    expiry_ms: int = 1800000000000,
++) -> Instrument:
++    """Create a valid Instrument dataclass from an instrument name."""
++    opt_type, strike, _ = parse_instrument_metadata(name)
++    return Instrument(
++        instrument_name=name,
++        option_type=opt_type,
++        strike_usd=strike,
++        creation_ms=creation_ms,
++        expiry_ms=expiry_ms,
++        base_currency=Currency.BTC,
++        quote_currency=Currency.USD,
++        settlement_currency=Currency.BTC,
++        contract_size=contract_size,
++        min_qty=Decimal("0.1"),
++        qty_step=Decimal("0.1"),
++        qty_step_known=True,
++        tick_size=Decimal("0.0005"),
++        source_ref="ledger_instrument_factory",
++    )
++
++
++def apply_fill(
++    state: PortfolioState,
++    fill: Fill,
++    underlying_price_usd: Optional[Decimal] = None,
++    margin_config: Optional[MarginModelConfig] = None,
++    instrument_map: Optional[Mapping[str, Instrument]] = None,
++) -> PortfolioState:
++    """Apply an execution fill to the portfolio state.
++    
++    Conforms to FillApplicatorProtocol:
++    apply_fill(state: PortfolioState, fill: Fill) -> PortfolioState
++    
++    Invariants:
++    - Double-entry / net conservation: every cash change is recorded in the ledger.
++    - Idempotency: duplicate fills do not double-charge or duplicate entries.
++    - Insufficient capital check: long entry requires cash >= premium + fee.
++    - Short options require an explicit margin model; naked shorts are rejected by default.
++    - Reserves released strictly upon position close or settlement.
++    """
++    # 1. Idempotency check
++    event_prefix = f"fill_{fill.fill_id}_"
++    for entry in state.ledger:
++        if entry.event_id.startswith(event_prefix):
++            # Already applied, return state unmodified
++            return state
++
++    for pos in state.open_positions:
++        if any(f.fill_id == fill.fill_id for f in pos.open_fills) or any(f.fill_id == fill.fill_id for f in pos.close_fills):
++            return state
++
++    for pos in state.closed_positions:
++        if any(f.fill_id == fill.fill_id for f in pos.open_fills) or any(f.fill_id == fill.fill_id for f in pos.close_fills):
++            return state
++
++    # 2. Determine if this fill is an Entry or an Exit
++    existing_pos: Optional[Position] = None
++    for pos in state.open_positions:
++        if pos.position_id == fill.position_id:
++            existing_pos = pos
++            break
++
++    is_exit = False
++    if existing_pos is not None:
++        # If this leg already has an open fill, this fill is a closing exit fill
++        for open_f in existing_pos.open_fills:
++            if open_f.leg_id == fill.leg_id:
++                is_exit = True
++                break
++
++    # 3. Retrieve or construct Instrument
++    if instrument_map is not None and fill.instrument_name in instrument_map:
++        inst = instrument_map[fill.instrument_name]
++    else:
++        inst = make_instrument(fill.instrument_name)
++
++    contract_size = inst.contract_size
++    current_cash = state.cash_balance_btc
++    current_reserved = state.reserved_balance_btc
++    available_cash = current_cash - current_reserved
++
++    new_ledger: list[LedgerEntry] = list(state.ledger)
++    stress_ratio = margin_config.stress_reserve_ratio if margin_config else Decimal("0.5")
++
++    # ==========================================================================
++    # CASE 1: OPENING FILL (ENTRY)
++    # ==========================================================================
++    if not is_exit:
++        # Long Entry: BUY
++        if fill.side == Side.BUY:
++            premium_amount = fill.price_btc * fill.quantity * contract_size
++            total_required = premium_amount + fill.fee_btc
++
++            if available_cash < total_required:
++                raise InsufficientCapitalError(
++                    f"Insufficient cash for long entry: required {total_required} BTC, available {available_cash} BTC"
++                )
++
++            # Cash debits
++            bal_after_prem = current_cash - premium_amount
++            new_ledger.append(
++                LedgerEntry(
++                    event_id=f"fill_{fill.fill_id}_premium",
++                    position_id=fill.position_id,
++                    timestamp_ms=fill.actual_ms,
++                    currency=Currency.BTC,
++                    amount=-premium_amount,
++                    entry_type=EntryType.PREMIUM,
++                    balance_after=bal_after_prem,
++                    description=f"Long premium debit for {fill.instrument_name}",
++                )
++            )
++
++            bal_after_fee = bal_after_prem - fill.fee_btc
++            new_ledger.append(
++                LedgerEntry(
++                    event_id=f"fill_{fill.fill_id}_fee",
++                    position_id=fill.position_id,
++                    timestamp_ms=fill.actual_ms,
++                    currency=Currency.BTC,
++                    amount=-fill.fee_btc,
++                    entry_type=EntryType.FEE,
++                    balance_after=bal_after_fee,
++                    description=f"Trading fee debit for {fill.instrument_name}",
++                )
++            )
++
++            current_cash = bal_after_fee
++
++        # Short Entry: SELL
++        else:
++            # Check margin model requirement
++            if margin_config is None or not margin_config.allow_naked_short:
++                raise ShortPositionRejectedError(
++                    "Short positions require an explicit margin model and are rejected by default without configured model"
++                )
++
++            premium_credit = fill.price_btc * fill.quantity * contract_size
++            net_cash_added = premium_credit - fill.fee_btc
++
++            # Calculate stress reserve requirement
++            reserve_required = fill.quantity * contract_size * stress_ratio
++
++            # Check solvency including incoming premium
++            if (available_cash + net_cash_added) < reserve_required:
++                raise InsufficientCapitalError(
++                    f"Insufficient capital for short reserve: required {reserve_required} BTC, available {available_cash + net_cash_added} BTC"
++                )
++
++            # Cash credits
++            bal_after_prem = current_cash + premium_credit
++            new_ledger.append(
++                LedgerEntry(
++                    event_id=f"fill_{fill.fill_id}_premium",
++                    position_id=fill.position_id,
++                    timestamp_ms=fill.actual_ms,
++                    currency=Currency.BTC,
++                    amount=premium_credit,
++                    entry_type=EntryType.PREMIUM,
++                    balance_after=bal_after_prem,
++                    description=f"Short premium credit for {fill.instrument_name}",
++                )
++            )
++
++            bal_after_fee = bal_after_prem - fill.fee_btc
++            new_ledger.append(
++                LedgerEntry(
++                    event_id=f"fill_{fill.fill_id}_fee",
++                    position_id=fill.position_id,
++                    timestamp_ms=fill.actual_ms,
++                    currency=Currency.BTC,
++                    amount=-fill.fee_btc,
++                    entry_type=EntryType.FEE,
++                    balance_after=bal_after_fee,
++                    description=f"Trading fee debit for {fill.instrument_name}",
++                )
++            )
++
++            current_cash = bal_after_fee
++            current_reserved += reserve_required
++
++            # Record reserve lock in ledger
++            new_ledger.append(
++                LedgerEntry(
++                    event_id=f"fill_{fill.fill_id}_reserve",
++                    position_id=fill.position_id,
++                    timestamp_ms=fill.actual_ms,
++                    currency=Currency.BTC,
++                    amount=Decimal("0.0"),
++                    entry_type=EntryType.RESERVE_ADJUSTMENT,
++                    balance_after=current_cash,
++                    description=f"Locked {reserve_required} BTC stress reserve for short {fill.instrument_name}",
++                )
++            )
++
++        # Update Open Positions
++        new_open_positions: list[Position] = []
++        if existing_pos is None:
++            # Create new Position
++            new_pos = Position(
++                position_id=fill.position_id,
++                strategy_name="strategy_v1",
++                status=PositionStatus.OPEN,
++                legs=(inst,),
++                leg_quantities=(fill.quantity,),
++                opened_at_ms=fill.actual_ms,
++                closed_at_ms=None,
++                open_fills=(fill,),
++                close_fills=(),
++                realized_pnl_btc=Decimal("0.0"),
++                realized_pnl_usd=Decimal("0.0"),
++                exit_reason=None,
++            )
++            new_open_positions = list(state.open_positions) + [new_pos]
++        else:
++            # Add leg to existing multi-leg position
++            for p in state.open_positions:
++                if p.position_id == fill.position_id:
++                    updated_pos = Position(
++                        position_id=p.position_id,
++                        strategy_name=p.strategy_name,
++                        status=PositionStatus.OPEN,
++                        legs=p.legs + (inst,),
++                        leg_quantities=p.leg_quantities + (fill.quantity,),
++                        opened_at_ms=min(p.opened_at_ms, fill.actual_ms),
++                        closed_at_ms=None,
++                        open_fills=p.open_fills + (fill,),
++                        close_fills=p.close_fills,
++                        realized_pnl_btc=p.realized_pnl_btc,
++                        realized_pnl_usd=p.realized_pnl_usd,
++                        exit_reason=None,
++                    )
++                    new_open_positions.append(updated_pos)
++                else:
++                    new_open_positions.append(p)
++
++        return PortfolioState(
++            timestamp_ms=fill.actual_ms,
++            cash_balance_btc=current_cash,
++            reserved_balance_btc=current_reserved,
++            open_positions=tuple(new_open_positions),
++            closed_positions=state.closed_positions,
++            ledger=tuple(new_ledger),
++        )
++
++    # ==========================================================================
++    # CASE 2: CLOSING FILL (EXIT)
++    # ==========================================================================
++    assert existing_pos is not None
++    assert is_exit
++
++    # Long Exit: SELL
++    if fill.side == Side.SELL:
++        proceeds = fill.price_btc * fill.quantity * contract_size
++
++        bal_after_proceeds = current_cash + proceeds
++        new_ledger.append(
++            LedgerEntry(
++                event_id=f"fill_{fill.fill_id}_premium",
++                position_id=fill.position_id,
++                timestamp_ms=fill.actual_ms,
++                currency=Currency.BTC,
++                amount=proceeds,
++                entry_type=EntryType.PREMIUM,
++                balance_after=bal_after_proceeds,
++                description=f"Long proceeds credit for {fill.instrument_name}",
++            )
++        )
++
++        bal_after_fee = bal_after_proceeds - fill.fee_btc
++        new_ledger.append(
++            LedgerEntry(
++                event_id=f"fill_{fill.fill_id}_fee",
++                position_id=fill.position_id,
++                timestamp_ms=fill.actual_ms,
++                currency=Currency.BTC,
++                amount=-fill.fee_btc,
++                entry_type=EntryType.FEE,
++                balance_after=bal_after_fee,
++                description=f"Trading fee debit for {fill.instrument_name}",
++            )
++        )
++        current_cash = bal_after_fee
++
++    # Short Exit: BUY (buyback)
++    else:
++        buyback_cost = fill.price_btc * fill.quantity * contract_size
++        reserve_to_release = fill.quantity * contract_size * stress_ratio
++
++        # Release reserve
++        current_reserved = max(Decimal("0.0"), current_reserved - reserve_to_release)
++
++        bal_after_cost = current_cash - buyback_cost
++        new_ledger.append(
++            LedgerEntry(
++                event_id=f"fill_{fill.fill_id}_premium",
++                position_id=fill.position_id,
++                timestamp_ms=fill.actual_ms,
++                currency=Currency.BTC,
++                amount=-buyback_cost,
++                entry_type=EntryType.PREMIUM,
++                balance_after=bal_after_cost,
++                description=f"Short buyback debit for {fill.instrument_name}",
++            )
++        )
++
++        bal_after_fee = bal_after_cost - fill.fee_btc
++        new_ledger.append(
++            LedgerEntry(
++                event_id=f"fill_{fill.fill_id}_fee",
++                position_id=fill.position_id,
++                timestamp_ms=fill.actual_ms,
++                currency=Currency.BTC,
++                amount=-fill.fee_btc,
++                entry_type=EntryType.FEE,
++                balance_after=bal_after_fee,
++                description=f"Trading fee debit for {fill.instrument_name}",
++            )
++        )
++        current_cash = bal_after_fee
++
++        new_ledger.append(
++            LedgerEntry(
++                event_id=f"fill_{fill.fill_id}_reserve",
++                position_id=fill.position_id,
++                timestamp_ms=fill.actual_ms,
++                currency=Currency.BTC,
++                amount=Decimal("0.0"),
++                entry_type=EntryType.RESERVE_ADJUSTMENT,
++                balance_after=current_cash,
++                description=f"Released {reserve_to_release} BTC stress reserve upon closing short {fill.instrument_name}",
++            )
++        )
++
++    # Check if position is now fully closed
++    updated_close_fills = existing_pos.close_fills + (fill,)
++    all_legs_closed = len(updated_close_fills) >= len(existing_pos.open_fills)
++
++    new_open_positions = []
++    new_closed_positions = list(state.closed_positions)
++
++    if all_legs_closed:
++        # Calculate final realized PnL for the position
++        total_open_cashflow = Decimal("0.0")
++        total_open_fees = Decimal("0.0")
++        for of in existing_pos.open_fills:
++            total_open_fees += of.fee_btc
++            if of.side == Side.BUY:
++                total_open_cashflow -= (of.price_btc * of.quantity * contract_size)
++            else:
++                total_open_cashflow += (of.price_btc * of.quantity * contract_size)
++
++        total_close_cashflow = Decimal("0.0")
++        total_close_fees = Decimal("0.0")
++        for cf in updated_close_fills:
++            total_close_fees += cf.fee_btc
++            if cf.side == Side.BUY:
++                total_close_cashflow -= (cf.price_btc * cf.quantity * contract_size)
++            else:
++                total_close_cashflow += (cf.price_btc * cf.quantity * contract_size)
++
++        realized_pnl_btc = (total_open_cashflow + total_close_cashflow) - (total_open_fees + total_close_fees)
++        
++        # Realized USD PnL at closing rate
++        if underlying_price_usd is not None:
++            realized_pnl_usd = realized_pnl_btc * underlying_price_usd
++        else:
++            realized_pnl_usd = Decimal("0.0")
++
++        closed_pos = Position(
++            position_id=existing_pos.position_id,
++            strategy_name=existing_pos.strategy_name,
++            status=PositionStatus.CLOSED,
++            legs=existing_pos.legs,
++            leg_quantities=existing_pos.leg_quantities,
++            opened_at_ms=existing_pos.opened_at_ms,
++            closed_at_ms=fill.actual_ms,
++            open_fills=existing_pos.open_fills,
++            close_fills=updated_close_fills,
++            realized_pnl_btc=realized_pnl_btc,
++            realized_pnl_usd=realized_pnl_usd,
++            exit_reason=ReasonCode.TAKE_PROFIT,
++        )
++        new_closed_positions.append(closed_pos)
++        for p in state.open_positions:
++            if p.position_id != fill.position_id:
++                new_open_positions.append(p)
++    else:
++        # Partially closed multi-leg position
++        for p in state.open_positions:
++            if p.position_id == fill.position_id:
++                partially_closed = Position(
++                    position_id=p.position_id,
++                    strategy_name=p.strategy_name,
++                    status=PositionStatus.OPEN,
++                    legs=p.legs,
++                    leg_quantities=p.leg_quantities,
++                    opened_at_ms=p.opened_at_ms,
++                    closed_at_ms=None,
++                    open_fills=p.open_fills,
++                    close_fills=updated_close_fills,
++                    realized_pnl_btc=p.realized_pnl_btc,
++                    realized_pnl_usd=p.realized_pnl_usd,
++                    exit_reason=None,
++                )
++                new_open_positions.append(partially_closed)
++            else:
++                new_open_positions.append(p)
++
++    return PortfolioState(
++        timestamp_ms=fill.actual_ms,
++        cash_balance_btc=current_cash,
++        reserved_balance_btc=current_reserved,
++        open_positions=tuple(new_open_positions),
++        closed_positions=tuple(new_closed_positions),
++        ledger=tuple(new_ledger),
++    )
+diff --git a/portfolio/settlement_service.py b/portfolio/settlement_service.py
+new file mode 100644
+--- /dev/null
++++ b/portfolio/settlement_service.py
+@@ -0,0 +1,257 @@
++"""
++Settlement processing service for Deribit BTC inverse options.
++Implements SettlerProtocol conforming to schema 1.0.
++"""
++
++from __future__ import annotations
++
++from decimal import Decimal
++from typing import Optional
++
++from core.contracts import (
++    Currency,
++    EntryType,
++    LedgerEntry,
++    OptionType,
++    PortfolioState,
++    Position,
++    PositionStatus,
++    ReasonCode,
++    SettlementObservation,
++    SettlerProtocol,
++    Side,
++)
++from ingestion.settlement import (
++    CONTRACT_SIZE_BTC,
++    calculate_inverse_option_payoff_per_contract,
++    is_daily_option,
++)
++from portfolio.models import MarginModelConfig
++
++
++def compute_delivery_fee(
++    quantity: Decimal,
++    payoff_btc: Decimal,
++    instrument_name: str,
++    contract_size: Decimal = CONTRACT_SIZE_BTC,
++) -> Decimal:
++    """Compute delivery fee in BTC per Deribit rules.
++    
++    Daily options are strictly exempt (0.0 fee).
++    Other expiries: 0.015% (0.00015 BTC) capped at 12.5% of delivery value.
++    """
++    if is_daily_option(instrument_name):
++        return Decimal("0.0")
++
++    uncapped_fee = quantity * contract_size * Decimal("0.00015")
++    cap = quantity * contract_size * payoff_btc * Decimal("0.125")
++    return min(uncapped_fee, cap)
++
++
++def settle(
++    state: PortfolioState,
++    settlement: SettlementObservation,
++    margin_config: Optional[MarginModelConfig] = None,
++) -> PortfolioState:
++    """Apply official delivery settlement to matching open positions.
++    
++    Conforms to SettlerProtocol:
++    settle(state: PortfolioState, settlement: SettlementObservation) -> PortfolioState
++    
++    Invariants:
++    - Settlement is idempotent (applied strictly once per instrument expiry).
++    - Missing exit data on other positions does NOT delete or alter them.
++    - Inverse option payoff: Call = max(S - K, 0) / S; Put = max(K - S, 0) / S.
++    - Reserves locked for short options are released upon settlement.
++    - Double-entry / net conservation: all cash changes are recorded in the ledger.
++    """
++    event_id_prefix = f"settle_{settlement.instrument_name}_{settlement.expiry_ms}_"
++    
++    # 1. Idempotency check: has this instrument already been settled?
++    for entry in state.ledger:
++        if entry.event_id.startswith(event_id_prefix):
++            return state
++
++    current_cash = state.cash_balance_btc
++    current_reserved = state.reserved_balance_btc
++    new_ledger: list[LedgerEntry] = list(state.ledger)
++    stress_ratio = margin_config.stress_reserve_ratio if margin_config else Decimal("0.5")
++
++    matching_positions: list[Position] = []
++    unaffected_positions: list[Position] = []
++
++    for pos in state.open_positions:
++        has_matching_leg = any(
++            leg.instrument_name == settlement.instrument_name and leg.expiry_ms == settlement.expiry_ms
++            for leg in pos.legs
++        )
++        if has_matching_leg:
++            matching_positions.append(pos)
++        else:
++            unaffected_positions.append(pos)
++
++    # If no open positions match, return state unmodified
++    if not matching_positions:
++        return state
++
++    new_closed_positions: list[Position] = list(state.closed_positions)
++
++    for pos in matching_positions:
++        # Calculate settlement cashflow for matching legs
++        total_settlement_cashflow = Decimal("0.0")
++        total_delivery_fees = Decimal("0.0")
++        reserved_to_release = Decimal("0.0")
++
++        for idx, leg in enumerate(pos.legs):
++            if leg.instrument_name != settlement.instrument_name:
++                continue
++
++            open_f = pos.open_fills[idx] if idx < len(pos.open_fills) else None
++            qty = pos.leg_quantities[idx]
++            contract_size = leg.contract_size
++
++            # Payoff in BTC per contract
++            payoff_per_contract = calculate_inverse_option_payoff_per_contract(
++                option_type=leg.option_type,
++                strike_usd=leg.strike_usd,
++                settlement_price_usd=settlement.settlement_price_usd,
++            )
++            total_payoff = payoff_per_contract * qty * contract_size
++            deliv_fee = compute_delivery_fee(
++                quantity=qty,
++                payoff_btc=payoff_per_contract,
++                instrument_name=leg.instrument_name,
++                contract_size=contract_size,
++            )
++
++            # Long position receives payoff
++            if open_f is not None and open_f.side == Side.BUY:
++                if total_payoff > Decimal("0.0"):
++                    bal_after_payoff = current_cash + total_payoff
++                    new_ledger.append(
++                        LedgerEntry(
++                            event_id=f"{event_id_prefix}{pos.position_id}_payoff",
++                            position_id=pos.position_id,
++                            timestamp_ms=settlement.expiry_ms,
++                            currency=Currency.BTC,
++                            amount=total_payoff,
++                            entry_type=EntryType.SETTLEMENT,
++                            balance_after=bal_after_payoff,
++                            description=f"Settlement payoff credit for {leg.instrument_name}",
++                        )
++                    )
++                    current_cash = bal_after_payoff
++
++                if deliv_fee > Decimal("0.0"):
++                    bal_after_fee = current_cash - deliv_fee
++                    new_ledger.append(
++                        LedgerEntry(
++                            event_id=f"{event_id_prefix}{pos.position_id}_fee",
++                            position_id=pos.position_id,
++                            timestamp_ms=settlement.expiry_ms,
++                            currency=Currency.BTC,
++                            amount=-deliv_fee,
++                            entry_type=EntryType.FEE,
++                            balance_after=bal_after_fee,
++                            description=f"Delivery fee debit for {leg.instrument_name}",
++                        )
++                    )
++                    current_cash = bal_after_fee
++
++                total_settlement_cashflow += total_payoff
++                total_delivery_fees += deliv_fee
++
++            # Short position pays payoff
++            else:
++                if total_payoff > Decimal("0.0"):
++                    bal_after_payoff = current_cash - total_payoff
++                    new_ledger.append(
++                        LedgerEntry(
++                            event_id=f"{event_id_prefix}{pos.position_id}_payoff",
++                            position_id=pos.position_id,
++                            timestamp_ms=settlement.expiry_ms,
++                            currency=Currency.BTC,
++                            amount=-total_payoff,
++                            entry_type=EntryType.SETTLEMENT,
++                            balance_after=bal_after_payoff,
++                            description=f"Settlement payoff debit for short {leg.instrument_name}",
++                        )
++                    )
++                    current_cash = bal_after_payoff
++
++                if deliv_fee > Decimal("0.0"):
++                    bal_after_fee = current_cash - deliv_fee
++                    new_ledger.append(
++                        LedgerEntry(
++                            event_id=f"{event_id_prefix}{pos.position_id}_fee",
++                            position_id=pos.position_id,
++                            timestamp_ms=settlement.expiry_ms,
++                            currency=Currency.BTC,
++                            amount=-deliv_fee,
++                            entry_type=EntryType.FEE,
++                            balance_after=bal_after_fee,
++                            description=f"Delivery fee debit for short {leg.instrument_name}",
++                        )
++                    )
++                    current_cash = bal_after_fee
++
++                total_settlement_cashflow -= total_payoff
++                total_delivery_fees += deliv_fee
++
++                # Calculate reserve to release
++                rel = qty * contract_size * stress_ratio
++                reserved_to_release += rel
++
++        if reserved_to_release > Decimal("0.0"):
++            current_reserved = max(Decimal("0.0"), current_reserved - reserved_to_release)
++            new_ledger.append(
++                LedgerEntry(
++                    event_id=f"{event_id_prefix}{pos.position_id}_reserve_release",
++                    position_id=pos.position_id,
++                    timestamp_ms=settlement.expiry_ms,
++                    currency=Currency.BTC,
++                    amount=Decimal("0.0"),
++                    entry_type=EntryType.RESERVE_ADJUSTMENT,
++                    balance_after=current_cash,
++                    description=f"Released {reserved_to_release} BTC stress reserve upon settlement",
++                )
++            )
++
++        # Calculate position realized PnL
++        open_cashflow = Decimal("0.0")
++        open_fees = Decimal("0.0")
++        for of in pos.open_fills:
++            open_fees += of.fee_btc
++            if of.side == Side.BUY:
++                open_cashflow -= (of.price_btc * of.quantity)
++            else:
++                open_cashflow += (of.price_btc * of.quantity)
++
++        # Total position realized PnL in BTC:
++        realized_pnl_btc = (open_cashflow + total_settlement_cashflow) - (open_fees + total_delivery_fees)
++        realized_pnl_usd = realized_pnl_btc * settlement.settlement_price_usd
++
++        settled_pos = Position(
++            position_id=pos.position_id,
++            strategy_name=pos.strategy_name,
++            status=PositionStatus.SETTLED,
++            legs=pos.legs,
++            leg_quantities=pos.leg_quantities,
++            opened_at_ms=pos.opened_at_ms,
++            closed_at_ms=settlement.expiry_ms,
++            open_fills=pos.open_fills,
++            close_fills=pos.close_fills,
++            realized_pnl_btc=realized_pnl_btc,
++            realized_pnl_usd=realized_pnl_usd,
++            exit_reason=ReasonCode.CONTRACT_EXPIRY,
++        )
++        new_closed_positions.append(settled_pos)
++
++    return PortfolioState(
++        timestamp_ms=settlement.expiry_ms,
++        cash_balance_btc=current_cash,
++        reserved_balance_btc=current_reserved,
++        open_positions=tuple(unaffected_positions),
++        closed_positions=tuple(new_closed_positions),
++        ledger=tuple(new_ledger),
++    )
+diff --git a/portfolio/valuation.py b/portfolio/valuation.py
+new file mode 100644
+--- /dev/null
++++ b/portfolio/valuation.py
+@@ -0,0 +1,185 @@
++"""
++Portfolio valuation, equity tracking, and margin risk breach monitoring.
++"""
++
++from __future__ import annotations
++
++from dataclasses import dataclass
++from decimal import Decimal
++from typing import Mapping, Optional, Sequence, Tuple
++
++from core.contracts import (
++    EquityPoint,
++    OptionType,
++    PortfolioState,
++    PositionStatus,
++    Side,
++    validate_decimal,
++    validate_timestamp_ms,
++)
++from portfolio.models import MarginModelConfig, RiskBreach
++
++
++@dataclass(frozen=True)
++class AccountingMetricsSummary:
++    """Explicitly separated accounting metrics per Task 12 specification:
++    
++    1. realized_trade_pnl_btc: Total realized PnL of closed/settled trades in BTC.
++    2. realized_trade_pnl_usd: Realized trade PnL converted at the respective exit/settlement exchange rate.
++    3. portfolio_usd_change_from_start: Change in total portfolio USD equity from initial capital.
++    4. benchmark_buy_and_hold_btc: Benchmark holding initial capital in BTC.
++    """
++    realized_trade_pnl_btc: Decimal
++    realized_trade_pnl_usd: Decimal
++    portfolio_usd_change_from_start: Decimal
++    benchmark_buy_and_hold_btc: Decimal
++    benchmark_buy_and_hold_usd: Decimal
++    total_equity_btc: Decimal
++    total_equity_usd: Decimal
++
++
++def evaluate_equity(
++    state: PortfolioState,
++    timestamp_ms: int,
++    underlying_price_usd: Decimal,
++    benchmark_initial_btc: Decimal,
++    option_mark_prices: Optional[Mapping[str, Decimal]] = None,
++    is_valuation_reliable: bool = True,
++    quality_note: str = "",
++) -> EquityPoint:
++    """Calculate portfolio equity snapshot at a point in time."""
++    validate_timestamp_ms(timestamp_ms, "timestamp_ms")
++    u_price = validate_decimal(underlying_price_usd, "underlying_price_usd", strictly_positive=True)
++    bench_btc = validate_decimal(benchmark_initial_btc, "benchmark_initial_btc", non_negative=True)
++
++    # Calculate unrealized PnL across open positions
++    unrealized_pnl_btc = Decimal("0.0")
++    if option_mark_prices:
++        for pos in state.open_positions:
++            for idx, leg in enumerate(pos.legs):
++                mark = option_mark_prices.get(leg.instrument_name)
++                if mark is not None and idx < len(pos.open_fills):
++                    of = pos.open_fills[idx]
++                    qty = pos.leg_quantities[idx]
++                    if of.side == Side.BUY:
++                        unrealized_pnl_btc += (mark - of.price_btc) * qty
++                    else:
++                        unrealized_pnl_btc += (of.price_btc - mark) * qty
++
++    # Total equity in BTC = cash_balance_btc + unrealized_pnl_btc
++    total_equity_btc = state.cash_balance_btc + unrealized_pnl_btc
++    total_equity_usd = total_equity_btc * u_price
++
++    return EquityPoint(
++        timestamp_ms=timestamp_ms,
++        cash_balance_btc=state.cash_balance_btc,
++        reserved_balance_btc=state.reserved_balance_btc,
++        unrealized_pnl_btc=unrealized_pnl_btc,
++        total_equity_btc=total_equity_btc,
++        underlying_price_usd=u_price,
++        total_equity_usd=total_equity_usd,
++        benchmark_buy_and_hold_btc=bench_btc,
++        is_valuation_reliable=is_valuation_reliable,
++        quality_note=quality_note,
++    )
++
++
++def compute_accounting_summary(
++    state: PortfolioState,
++    initial_cash_btc: Decimal,
++    initial_underlying_usd: Decimal,
++    current_underlying_usd: Decimal,
++    option_mark_prices: Optional[Mapping[str, Decimal]] = None,
++) -> AccountingMetricsSummary:
++    """Compute the 4 strictly separated performance metrics.
++    
++    Shows distinction between:
++    - Trade USD PnL (converted at trade close exchange rate).
++    - Portfolio USD change (includes underlying BTC price change on cash balances).
++    """
++    init_cash = validate_decimal(initial_cash_btc, "initial_cash_btc", strictly_positive=True)
++    init_u = validate_decimal(initial_underlying_usd, "initial_underlying_usd", strictly_positive=True)
++    curr_u = validate_decimal(current_underlying_usd, "current_underlying_usd", strictly_positive=True)
++
++    # 1 & 2. Realized Trade PnL in BTC and USD
++    realized_btc = sum((pos.realized_pnl_btc for pos in state.closed_positions), Decimal("0.0"))
++    realized_usd = sum((pos.realized_pnl_usd for pos in state.closed_positions), Decimal("0.0"))
++
++    # Current equity
++    equity_pt = evaluate_equity(
++        state=state,
++        timestamp_ms=state.timestamp_ms,
++        underlying_price_usd=curr_u,
++        benchmark_initial_btc=init_cash,
++        option_mark_prices=option_mark_prices,
++    )
++
++    # 3. Portfolio USD change from initial equity
++    initial_equity_usd = init_cash * init_u
++    portfolio_usd_change = equity_pt.total_equity_usd - initial_equity_usd
++
++    # 4. Benchmark buy-and-hold
++    benchmark_btc = init_cash
++    benchmark_usd = init_cash * curr_u
++
++    return AccountingMetricsSummary(
++        realized_trade_pnl_btc=realized_btc,
++        realized_trade_pnl_usd=realized_usd,
++        portfolio_usd_change_from_start=portfolio_usd_change,
++        benchmark_buy_and_hold_btc=benchmark_btc,
++        benchmark_buy_and_hold_usd=benchmark_usd,
++        total_equity_btc=equity_pt.total_equity_btc,
++        total_equity_usd=equity_pt.total_equity_usd,
++    )
++
++
++def check_risk_breaches(
++    state: PortfolioState,
++    underlying_price_usd: Decimal,
++    margin_config: MarginModelConfig,
++    timestamp_ms: int,
++) -> Tuple[RiskBreach, ...]:
++    """Inspect open short positions for stress reserve breaches.
++    
++    Strict rule: If liabilities exceed allocated stress reserves, report
++    a risk breach. Do NOT invent a fake liquidation order.
++    """
++    u_price = validate_decimal(underlying_price_usd, "underlying_price_usd", strictly_positive=True)
++    breaches: list[RiskBreach] = []
++
++    for pos in state.open_positions:
++        for idx, leg in enumerate(pos.legs):
++            of = pos.open_fills[idx] if idx < len(pos.open_fills) else None
++            if of is None or of.side != Side.SELL:
++                continue  # Only shorts have liability risk
++
++            qty = pos.leg_quantities[idx]
++            contract_size = leg.contract_size
++            allocated_reserve = qty * contract_size * margin_config.stress_reserve_ratio
++
++            # Calculate intrinsic liability at current stress price
++            if leg.option_type == OptionType.CALL:
++                intrinsic = max(u_price - leg.strike_usd, Decimal("0.0")) / u_price
++            else:
++                intrinsic = max(leg.strike_usd - u_price, Decimal("0.0")) / u_price
++
++            liability_btc = intrinsic * qty * contract_size
++
++            if liability_btc > allocated_reserve:
++                breaches.append(
++                    RiskBreach(
++                        timestamp_ms=timestamp_ms,
++                        position_id=pos.position_id,
++                        instrument_name=leg.instrument_name,
++                        liability_btc=liability_btc,
++                        reserved_btc=allocated_reserve,
++                        underlying_price_usd=u_price,
++                        is_breached=True,
++                        message=(
++                            f"Short liability {liability_btc:.6f} BTC exceeds allocated "
++                            f"stress reserve {allocated_reserve:.6f} BTC at S=${u_price} (no fake liquidation)"
++                        ),
++                    )
++                )
++
++    return tuple(breaches)
+diff --git a/tests/test_portfolio_v1.py b/tests/test_portfolio_v1.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_portfolio_v1.py
+@@ -0,0 +1,541 @@
++"""
++Acceptance and unit tests for Task 12:
++- BTC cash ledger & double-entry net conservation
++- Identical BTC prices with different BTC/USD exchange rates
++- Explicit separation of Trade USD PnL vs Portfolio USD equity change vs Buy-and-Hold benchmark
++- Short margin stress reserves and release upon close/settlement
++- Insufficient capital rejection
++- Duplicate fill idempotency
++- Single execution settlement idempotency
++- Rejection of short positions without explicit margin model
++- Short stress risk breach reporting without fake liquidations
++- Missing exit preserving position and risk
++- Protocol conformance for FillApplicatorProtocol and SettlerProtocol
++"""
++
++from decimal import Decimal
++import unittest
++
++from core.contracts import (
++    Currency,
++    EntryType,
++    ExecutionModelId,
++    Fill,
++    FillApplicatorProtocol,
++    Instrument,
++    LedgerEntry,
++    OptionType,
++    PortfolioState,
++    Position,
++    PositionStatus,
++    ReasonCode,
++    SettlementObservation,
++    SettlerProtocol,
++    Side,
++)
++from portfolio import (
++    AccountingMetricsSummary,
++    DuplicateFillError,
++    InsufficientCapitalError,
++    MarginModelConfig,
++    PortfolioError,
++    RiskBreach,
++    SettlementError,
++    ShortPositionRejectedError,
++    apply_fill,
++    check_risk_breaches,
++    compute_accounting_summary,
++    evaluate_equity,
++    make_instrument,
++    settle,
++)
++
++
++class PortfolioV1AcceptanceTests(unittest.TestCase):
++    """Rigorous acceptance tests for Task 12 Portfolio Ledger and Margin Engine."""
++
++    def setUp(self) -> None:
++        self.initial_cash = Decimal("10.0")  # 10.0 BTC
++        self.call_instrument_name = "BTC-27DEC24-90000-C"
++        self.put_instrument_name = "BTC-27DEC24-90000-P"
++        self.base_state = PortfolioState(
++            timestamp_ms=1711700000000,
++            cash_balance_btc=self.initial_cash,
++            reserved_balance_btc=Decimal("0.0"),
++            open_positions=(),
++            closed_positions=(),
++            ledger=(),
++        )
++        self.margin_config = MarginModelConfig(
++            model_name="conservative_stress_reserve",
++            stress_reserve_ratio=Decimal("0.5"),
++            exchange_margin_equivalent=False,
++            allow_naked_short=True,
++        )
++
++    # --------------------------------------------------------------------------
++    # 1. Protocol Conformance
++    # --------------------------------------------------------------------------
++    def test_protocol_conformance(self) -> None:
++        """apply_fill and settle satisfy FillApplicatorProtocol and SettlerProtocol."""
++        self.assertTrue(isinstance(apply_fill, FillApplicatorProtocol))
++        self.assertTrue(isinstance(settle, SettlerProtocol))
++
++    # --------------------------------------------------------------------------
++    # 2. Double-Entry / Net Conservation
++    # --------------------------------------------------------------------------
++    def test_double_entry_net_conservation(self) -> None:
++        """Every transaction updates cash balance strictly by balance_after == balance_before + amount."""
++        # Long entry
++        fill_entry = Fill(
++            fill_id="fill_de_01",
++            order_id="ord_de_01",
++            position_id="pos_de_1",
++            leg_id="leg_call",
++            instrument_name=self.call_instrument_name,
++            side=Side.BUY,
++            actual_ms=1711700010000,
++            model_timestamp_ms=1711700000000,
++            quantity=Decimal("1.0"),
++            price_btc=Decimal("0.0800"),
++            fee_btc=Decimal("0.0003"),
++            reference_price_btc=Decimal("0.0800"),
++            spread_slippage_cost_btc=Decimal("0.0"),
++            execution_model_id=ExecutionModelId.MODEL_A_BID_ASK,
++        )
++        state_1 = apply_fill(self.base_state, fill_entry)
++
++        # Long exit
++        fill_exit = Fill(
++            fill_id="fill_de_02",
++            order_id="ord_de_02",
++            position_id="pos_de_1",
++            leg_id="leg_call",
++            instrument_name=self.call_instrument_name,
++            side=Side.SELL,
++            actual_ms=1711703600000,
++            model_timestamp_ms=1711703600000,
++            quantity=Decimal("1.0"),
++            price_btc=Decimal("0.1000"),
++            fee_btc=Decimal("0.0003"),
++            reference_price_btc=Decimal("0.1000"),
++            spread_slippage_cost_btc=Decimal("0.0"),
++            execution_model_id=ExecutionModelId.MODEL_A_BID_ASK,
++        )
++        state_2 = apply_fill(state_1, fill_exit)
++
++        # Verify net conservation on ledger
++        running_cash = self.initial_cash
++        for entry in state_2.ledger:
++            if entry.entry_type != EntryType.RESERVE_ADJUSTMENT:
++                expected_balance = running_cash + entry.amount
++                self.assertEqual(
++                    entry.balance_after,
++                    expected_balance,
++                    f"Double-entry violation in entry {entry.event_id}",
++                )
++                running_cash = expected_balance
++
++        self.assertEqual(running_cash, state_2.cash_balance_btc)
++        # Net cash change = -0.0800 - 0.0003 + 0.1000 - 0.0003 = +0.0194 BTC
++        self.assertEqual(state_2.cash_balance_btc, Decimal("10.0194"))
++
++    # --------------------------------------------------------------------------
++    # 3. Currency Separation & Accounting Distinction
++    # --------------------------------------------------------------------------
++    def test_same_btc_price_different_usd_rates_accounting_separation(self) -> None:
++        """Identical BTC trade results produce different USD PnL at different closing exchange rates.
++        
++        Explicitly verifies the 4 separate metrics:
++        1. Realized trade PnL BTC
++        2. Realized trade PnL USD (at exit rate)
++        3. Portfolio USD change from start
++        4. Benchmark buy-and-hold BTC/USD
++        """
++        # Scenario A: Exits at BTC/USD = $60,000
++        # Buy at 0.05 BTC (fee 0.0003), Sell at 0.08 BTC (fee 0.0003). Net = +0.0294 BTC.
++        fill_buy = Fill(
++            fill_id="f_buy_a",
++            order_id="o_buy_a",
++            position_id="pos_cur_a",
++            leg_id="leg_call",
++            instrument_name=self.call_instrument_name,
++            side=Side.BUY,
++            actual_ms=1711700010000,
++            model_timestamp_ms=1711700000000,
++            quantity=Decimal("1.0"),
++            price_btc=Decimal("0.0500"),
++            fee_btc=Decimal("0.0003"),
++            reference_price_btc=Decimal("0.0500"),
++            spread_slippage_cost_btc=Decimal("0.0"),
++            execution_model_id=ExecutionModelId.MODEL_A_BID_ASK,
++        )
++        fill_sell_a = Fill(
++            fill_id="f_sell_a",
++            order_id="o_sell_a",
++            position_id="pos_cur_a",
++            leg_id="leg_call",
++            instrument_name=self.call_instrument_name,
++            side=Side.SELL,
++            actual_ms=1711703600000,
++            model_timestamp_ms=1711703600000,
++            quantity=Decimal("1.0"),
++            price_btc=Decimal("0.0800"),
++            fee_btc=Decimal("0.0003"),
++            reference_price_btc=Decimal("0.0800"),
++            spread_slippage_cost_btc=Decimal("0.0"),
++            execution_model_id=ExecutionModelId.MODEL_A_BID_ASK,
++        )
++
++        st_open_a = apply_fill(self.base_state, fill_buy)
++        st_close_a = apply_fill(st_open_a, fill_sell_a, underlying_price_usd=Decimal("60000.0"))
++
++        # Scenario B: Exactly identical fills, but exits at BTC/USD = $100,000
++        fill_sell_b = Fill(
++            fill_id="f_sell_b",
++            order_id="o_sell_b",
++            position_id="pos_cur_a",
++            leg_id="leg_call",
++            instrument_name=self.call_instrument_name,
++            side=Side.SELL,
++            actual_ms=1711703600000,
++            model_timestamp_ms=1711703600000,
++            quantity=Decimal("1.0"),
++            price_btc=Decimal("0.0800"),
++            fee_btc=Decimal("0.0003"),
++            reference_price_btc=Decimal("0.0800"),
++            spread_slippage_cost_btc=Decimal("0.0"),
++            execution_model_id=ExecutionModelId.MODEL_A_BID_ASK,
++        )
++        st_close_b = apply_fill(st_open_a, fill_sell_b, underlying_price_usd=Decimal("100000.0"))
++
++        pos_a = st_close_a.closed_positions[0]
++        pos_b = st_close_b.closed_positions[0]
++
++        # Both have IDENTICAL realized BTC PnL: +0.0294 BTC
++        self.assertEqual(pos_a.realized_pnl_btc, Decimal("0.0294"))
++        self.assertEqual(pos_b.realized_pnl_btc, Decimal("0.0294"))
++
++        # But USD trade PnL differs by exchange rate:
++        # A: 0.0294 * 60,000 = $1,764
++        # B: 0.0294 * 100,000 = $2,940
++        self.assertEqual(pos_a.realized_pnl_usd, Decimal("1764.0"))
++        self.assertEqual(pos_b.realized_pnl_usd, Decimal("2940.0"))
++
++        # Now test full accounting separation summary
++        summary_a = compute_accounting_summary(
++            state=st_close_a,
++            initial_cash_btc=self.initial_cash,
++            initial_underlying_usd=Decimal("60000.0"),
++            current_underlying_usd=Decimal("60000.0"),
++        )
++        # Realized Trade USD PnL is $1,764
++        self.assertEqual(summary_a.realized_trade_pnl_usd, Decimal("1764.0"))
++        # Portfolio USD change: (10.0294 * 60000) - (10.0 * 60000) = $1,764
++        self.assertEqual(summary_a.portfolio_usd_change_from_start, Decimal("1764.0"))
++        # Benchmark buy and hold: 10.0 BTC = $600,000
++        self.assertEqual(summary_a.benchmark_buy_and_hold_btc, Decimal("10.0"))
++        self.assertEqual(summary_a.benchmark_buy_and_hold_usd, Decimal("600000.0"))
++
++    # --------------------------------------------------------------------------
++    # 4. Short Stress Reserves and Release Upon Close
++    # --------------------------------------------------------------------------
++    def test_short_stress_reserve_lock_and_release(self) -> None:
++        """Short positions lock stress reserve upon entry, released strictly upon close."""
++        short_entry_fill = Fill(
++            fill_id="f_short_open",
++            order_id="o_short_open",
++            position_id="pos_short_1",
++            leg_id="leg_call",
++            instrument_name=self.call_instrument_name,
++            side=Side.SELL,
++            actual_ms=1711700010000,
++            model_timestamp_ms=1711700000000,
++            quantity=Decimal("1.0"),
++            price_btc=Decimal("0.0800"),
++            fee_btc=Decimal("0.0003"),
++            reference_price_btc=Decimal("0.0800"),
++            spread_slippage_cost_btc=Decimal("0.0"),
++            execution_model_id=ExecutionModelId.MODEL_A_BID_ASK,
++        )
++        st_short_open = apply_fill(self.base_state, short_entry_fill, margin_config=self.margin_config)
++
++        # Reserve ratio 0.5 * 1.0 = 0.5 BTC locked
++        self.assertEqual(st_short_open.reserved_balance_btc, Decimal("0.5"))
++        # Cash = 10.0 + 0.0800 - 0.0003 = 10.0797 BTC
++        self.assertEqual(st_short_open.cash_balance_btc, Decimal("10.0797"))
++
++        # Short buyback exit
++        short_exit_fill = Fill(
++            fill_id="f_short_close",
++            order_id="o_short_close",
++            position_id="pos_short_1",
++            leg_id="leg_call",
++            instrument_name=self.call_instrument_name,
++            side=Side.BUY,
++            actual_ms=1711703600000,
++            model_timestamp_ms=1711703600000,
++            quantity=Decimal("1.0"),
++            price_btc=Decimal("0.0400"),  # Bought back cheaper
++            fee_btc=Decimal("0.0003"),
++            reference_price_btc=Decimal("0.0400"),
++            spread_slippage_cost_btc=Decimal("0.0"),
++            execution_model_id=ExecutionModelId.MODEL_A_BID_ASK,
++        )
++        st_short_closed = apply_fill(st_short_open, short_exit_fill, margin_config=self.margin_config)
++
++        # Reserve strictly released back to 0.0 BTC
++        self.assertEqual(st_short_closed.reserved_balance_btc, Decimal("0.0"))
++        # Cash = 10.0797 - 0.0400 - 0.0003 = 10.0394 BTC
++        self.assertEqual(st_short_closed.cash_balance_btc, Decimal("10.0394"))
++        # Realized BTC PnL = (0.0800 - 0.0400) - 0.0006 = +0.0394 BTC
++        self.assertEqual(st_short_closed.closed_positions[0].realized_pnl_btc, Decimal("0.0394"))
++
++    # --------------------------------------------------------------------------
++    # 5. Insufficient Capital Rejection
++    # --------------------------------------------------------------------------
++    def test_insufficient_capital_long_rejected(self) -> None:
++        """Attempting to buy options when premium exceeds available cash is rejected."""
++        broke_state = PortfolioState(
++            timestamp_ms=1711700000000,
++            cash_balance_btc=Decimal("0.05"),  # Only 0.05 BTC available
++            reserved_balance_btc=Decimal("0.0"),
++            open_positions=(),
++            closed_positions=(),
++            ledger=(),
++        )
++        expensive_fill = Fill(
++            fill_id="f_exp",
++            order_id="o_exp",
++            position_id="pos_exp",
++            leg_id="leg_call",
++            instrument_name=self.call_instrument_name,
++            side=Side.BUY,
++            actual_ms=1711700010000,
++            model_timestamp_ms=1711700000000,
++            quantity=Decimal("1.0"),
++            price_btc=Decimal("0.0800"),  # Costs 0.0803 > 0.05
++            fee_btc=Decimal("0.0003"),
++            reference_price_btc=Decimal("0.0800"),
++            spread_slippage_cost_btc=Decimal("0.0"),
++            execution_model_id=ExecutionModelId.MODEL_A_BID_ASK,
++        )
++        with self.assertRaises(InsufficientCapitalError):
++            apply_fill(broke_state, expensive_fill)
++
++    def test_insufficient_capital_short_reserve_rejected(self) -> None:
++        """Attempting to write short option without sufficient cash for stress reserve is rejected."""
++        broke_state = PortfolioState(
++            timestamp_ms=1711700000000,
++            cash_balance_btc=Decimal("0.10"),  # 0.10 BTC available
++            reserved_balance_btc=Decimal("0.0"),
++            open_positions=(),
++            closed_positions=(),
++            ledger=(),
++        )
++        # Requires 0.5 BTC reserve
++        short_fill = Fill(
++            fill_id="f_short_broke",
++            order_id="o_sb",
++            position_id="pos_sb",
++            leg_id="leg_call",
++            instrument_name=self.call_instrument_name,
++            side=Side.SELL,
++            actual_ms=1711700010000,
++            model_timestamp_ms=1711700000000,
++            quantity=Decimal("1.0"),
++            price_btc=Decimal("0.0800"),
++            fee_btc=Decimal("0.0003"),
++            reference_price_btc=Decimal("0.0800"),
++            spread_slippage_cost_btc=Decimal("0.0"),
++            execution_model_id=ExecutionModelId.MODEL_A_BID_ASK,
++        )
++        with self.assertRaises(InsufficientCapitalError):
++            apply_fill(broke_state, short_fill, margin_config=self.margin_config)
++
++    # --------------------------------------------------------------------------
++    # 6. Idempotency & Duplicate Fills
++    # --------------------------------------------------------------------------
++    def test_duplicate_fill_idempotency(self) -> None:
++        """Applying the identical fill twice does not double-charge cash or duplicate ledger."""
++        fill = Fill(
++            fill_id="f_idempotent",
++            order_id="o_idem",
++            position_id="pos_idem",
++            leg_id="leg_call",
++            instrument_name=self.call_instrument_name,
++            side=Side.BUY,
++            actual_ms=1711700010000,
++            model_timestamp_ms=1711700000000,
++            quantity=Decimal("1.0"),
++            price_btc=Decimal("0.0800"),
++            fee_btc=Decimal("0.0003"),
++            reference_price_btc=Decimal("0.0800"),
++            spread_slippage_cost_btc=Decimal("0.0"),
++            execution_model_id=ExecutionModelId.MODEL_A_BID_ASK,
++        )
++        state_once = apply_fill(self.base_state, fill)
++        state_twice = apply_fill(state_once, fill)
++
++        # Must be completely identical
++        self.assertEqual(state_once.cash_balance_btc, state_twice.cash_balance_btc)
++        self.assertEqual(len(state_once.ledger), len(state_twice.ledger))
++        self.assertEqual(len(state_once.open_positions), len(state_twice.open_positions))
++
++    # --------------------------------------------------------------------------
++    # 7. Settlement Single Execution & Idempotency
++    # --------------------------------------------------------------------------
++    def test_settlement_single_execution_and_idempotency(self) -> None:
++        """Settlement operates strictly once per instrument expiry; subsequent calls are no-ops."""
++        fill_call = Fill(
++            fill_id="f_set_call",
++            order_id="o_set_c",
++            position_id="pos_settle_test",
++            leg_id="leg_call",
++            instrument_name=self.call_instrument_name,
++            side=Side.BUY,
++            actual_ms=1711700010000,
++            model_timestamp_ms=1711700000000,
++            quantity=Decimal("1.0"),
++            price_btc=Decimal("0.0500"),
++            fee_btc=Decimal("0.0003"),
++            reference_price_btc=Decimal("0.0500"),
++            spread_slippage_cost_btc=Decimal("0.0"),
++            execution_model_id=ExecutionModelId.MODEL_A_BID_ASK,
++        )
++        st_open = apply_fill(self.base_state, fill_call)
++
++        # Settlement observation: BTC-27DEC24-90000-C expiry at S = $95,000 (ITM Call)
++        # Payoff per contract = (95000 - 90000) / 95000 = 5000 / 95000 = 0.05263158 BTC
++        settlement_obs = SettlementObservation(
++            instrument_name=self.call_instrument_name,
++            expiry_ms=1800000000000,
++            settlement_price_usd=Decimal("95000.0"),
++            settlement_price_btc=Decimal("0.05263158"),
++            is_official_delivery=True,
++        )
++        st_settled_1 = settle(st_open, settlement_obs)
++        self.assertEqual(len(st_settled_1.open_positions), 0)
++        self.assertEqual(len(st_settled_1.closed_positions), 1)
++        self.assertEqual(st_settled_1.closed_positions[0].status, PositionStatus.SETTLED)
++
++        # Settle second time: MUST be idempotent
++        st_settled_2 = settle(st_settled_1, settlement_obs)
++        self.assertEqual(st_settled_1.cash_balance_btc, st_settled_2.cash_balance_btc)
++        self.assertEqual(len(st_settled_1.ledger), len(st_settled_2.ledger))
++
++    # --------------------------------------------------------------------------
++    # 8. Rejection of Short Positions Without Explicit Margin Model
++    # --------------------------------------------------------------------------
++    def test_short_rejected_without_explicit_margin_model(self) -> None:
++        """Attempting to enter a short position without explicit margin model raises ShortPositionRejectedError."""
++        short_fill = Fill(
++            fill_id="f_nomodel",
++            order_id="o_nomodel",
++            position_id="pos_nm",
++            leg_id="leg_call",
++            instrument_name=self.call_instrument_name,
++            side=Side.SELL,
++            actual_ms=1711700010000,
++            model_timestamp_ms=1711700000000,
++            quantity=Decimal("1.0"),
++            price_btc=Decimal("0.0800"),
++            fee_btc=Decimal("0.0003"),
++            reference_price_btc=Decimal("0.0800"),
++            spread_slippage_cost_btc=Decimal("0.0"),
++            execution_model_id=ExecutionModelId.MODEL_A_BID_ASK,
++        )
++        # margin_config=None
++        with self.assertRaises(ShortPositionRejectedError):
++            apply_fill(self.base_state, short_fill, margin_config=None)
++
++        # margin_config with allow_naked_short=False
++        strict_margin = MarginModelConfig(allow_naked_short=False)
++        with self.assertRaises(ShortPositionRejectedError):
++            apply_fill(self.base_state, short_fill, margin_config=strict_margin)
++
++    # --------------------------------------------------------------------------
++    # 9. Short Stress Risk Breach Reporting Without Fake Liquidation
++    # --------------------------------------------------------------------------
++    def test_short_stress_risk_breach_reported_no_fake_liquidation(self) -> None:
++        """When liability exceeds reserve under extreme prices, report risk breach without fake liquidations."""
++        short_fill = Fill(
++            fill_id="f_breach_test",
++            order_id="o_bt",
++            position_id="pos_bt",
++            leg_id="leg_call",
++            instrument_name=self.call_instrument_name,  # Strike $90,000 Call
++            side=Side.SELL,
++            actual_ms=1711700010000,
++            model_timestamp_ms=1711700000000,
++            quantity=Decimal("1.0"),
++            price_btc=Decimal("0.0800"),
++            fee_btc=Decimal("0.0003"),
++            reference_price_btc=Decimal("0.0800"),
++            spread_slippage_cost_btc=Decimal("0.0"),
++            execution_model_id=ExecutionModelId.MODEL_A_BID_ASK,
++        )
++        st_open = apply_fill(self.base_state, short_fill, margin_config=self.margin_config)
++        # Reserved = 0.5 BTC
++
++        # Price surges to $250,000 (extreme stress)
++        # Call liability = (250,000 - 90,000) / 250,000 = 160,000 / 250,000 = 0.6400 BTC
++        # Liability (0.64 BTC) > Allocated Reserve (0.50 BTC) -> RISK BREACH!
++        breaches = check_risk_breaches(
++            state=st_open,
++            underlying_price_usd=Decimal("250000.0"),
++            margin_config=self.margin_config,
++            timestamp_ms=1711705000000,
++        )
++        self.assertEqual(len(breaches), 1)
++        breach = breaches[0]
++        self.assertTrue(breach.is_breached)
++        self.assertGreater(breach.liability_btc, breach.reserved_btc)
++        self.assertIn("no fake liquidation", breach.message.lower())
++
++        # CRITICAL INVARIANT: The position must STILL BE OPEN! (No fake liquidation was manufactured!)
++        self.assertEqual(len(st_open.open_positions), 1)
++        self.assertEqual(st_open.open_positions[0].status, PositionStatus.OPEN)
++
++    # --------------------------------------------------------------------------
++    # 10. Missing Exit Preserves Position and Risk
++    # --------------------------------------------------------------------------
++    def test_missing_exit_preserves_position(self) -> None:
++        """Missing exit data keeps position open and preserves risk; never deleted."""
++        fill = Fill(
++            fill_id="f_no_exit",
++            order_id="o_ne",
++            position_id="pos_ne",
++            leg_id="leg_call",
++            instrument_name=self.call_instrument_name,
++            side=Side.BUY,
++            actual_ms=1711700010000,
++            model_timestamp_ms=1711700000000,
++            quantity=Decimal("1.0"),
++            price_btc=Decimal("0.0800"),
++            fee_btc=Decimal("0.0003"),
++            reference_price_btc=Decimal("0.0800"),
++            spread_slippage_cost_btc=Decimal("0.0"),
++            execution_model_id=ExecutionModelId.MODEL_A_BID_ASK,
++        )
++        st_open = apply_fill(self.base_state, fill)
++        self.assertEqual(len(st_open.open_positions), 1)
++
++        # Settle an unrelated instrument
++        unrelated_settle = SettlementObservation(
++            instrument_name="BTC-29MAR24-60000-C",
++            expiry_ms=1711699200000,
++            settlement_price_usd=Decimal("68000.0"),
++            settlement_price_btc=Decimal("0.1176"),
++            is_official_delivery=True,
++        )
++        st_after = settle(st_open, unrelated_settle)
++
++        # Original position remains intact in open_positions
++        self.assertEqual(len(st_after.open_positions), 1)
++        self.assertEqual(st_after.open_positions[0].position_id, "pos_ne")
++        self.assertEqual(st_after.open_positions[0].status, PositionStatus.OPEN)
++
++
++if __name__ == "__main__":
++    unittest.main()

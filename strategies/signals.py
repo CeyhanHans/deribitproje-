@@ -1,0 +1,418 @@
+"""Pure signal and calendar engine for Deribit BTC inverse options backtest catalog.
+
+Provides evaluate_signals complying with SignalEvaluatorProtocol:
+- Pure functional design: zero network requests, zero file I/O
+- Prefix invariance: future bars never affect decisions at or before T
+- Anti-lookahead: incomplete bars (bucket_end > T or available_at > T) strictly excluded
+- Warmup gating: insufficient history window blocks entry until warmup is satisfied
+- Schedule engines: UTC daily (e.g. 08:00 UTC), weekly (e.g. Friday 08:00 UTC), every_n_bars, and first eligible
+- Gates: cooldown period gate, max concurrent open positions gate, DTE gate
+- Optional rolling realized volatility and underlying return filters from completed bars
+- Deterministic signal generation and duplicate suppression for re-evaluations
+- Explicit rejection of unsupported features (IV/OI filters)
+"""
+
+from __future__ import annotations
+
+import math
+import statistics
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from decimal import Decimal
+from typing import Any, Mapping, Optional, Sequence, Tuple
+
+from core.contracts import (
+    Instrument,
+    OptionType,
+    PortfolioState,
+    Position,
+    PositionStatus,
+    ReasonCode,
+    RunConfig,
+    SelectionDecision,
+    Side,
+    Signal,
+    SignalEvaluatorProtocol,
+)
+from strategies.strategy_schema import RunConfigDefinition, StrategyDefinition
+
+DAY_MS = 86_400_000
+HOUR_MS = 3_600_000
+
+UNSUPPORTED_FILTERS = {
+    "implied_volatility",
+    "iv",
+    "iv_filter",
+    "open_interest",
+    "oi",
+    "oi_filter",
+    "order_book_depth",
+    "greeks_surface",
+}
+
+
+class SignalEvaluationError(ValueError):
+    """Raised when signal evaluation configuration is invalid."""
+
+
+class UnsupportedFilterError(SignalEvaluationError):
+    """Raised when an unsupported filter (e.g. IV, Open Interest) is requested."""
+
+
+@dataclass(frozen=True)
+class HistoryAsOf:
+    """Market context and historical bars available at decision time T."""
+    decision_at_ms: int
+    completed_bars: Sequence[Any] = ()
+    current_bar: Any = None
+    underlying_price_usd: Decimal | None = None
+    candidate_decision: Optional[SelectionDecision] = None
+    candidate_instruments: Sequence[Instrument] = ()
+    metadata: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if isinstance(self.decision_at_ms, bool) or not isinstance(self.decision_at_ms, int) or self.decision_at_ms <= 0:
+            raise SignalEvaluationError(f"decision_at_ms must be a positive integer, got {self.decision_at_ms!r}")
+
+
+def _is_bar_completed(bar: Any, decision_at_ms: int) -> bool:
+    """Verify that a bar is completed at decision_at_ms without lookahead.
+
+    Incomplete bar is excluded:
+    - bucket_end must be <= decision_at_ms
+    - available_at (if present) must be <= decision_at_ms
+    """
+    end_ms = None
+    if hasattr(bar, "bucket_end"):
+        end_ms = bar.bucket_end
+    elif hasattr(bar, "interval_end"):
+        end_ms = bar.interval_end
+    elif isinstance(bar, Mapping):
+        end_ms = bar.get("bucket_end", bar.get("interval_end", bar.get("end_ms")))
+
+    if end_ms is not None and end_ms > decision_at_ms:
+        return False
+
+    avail_ms = getattr(bar, "available_at", getattr(bar, "available_at_ms", None))
+    if avail_ms is None and isinstance(bar, Mapping):
+        avail_ms = bar.get("available_at", bar.get("available_at_ms"))
+    if avail_ms is not None and avail_ms > decision_at_ms:
+        return False
+
+    return True
+
+
+def _extract_close_price(bar: Any) -> float:
+    """Extract numeric close price from a bar or price observation."""
+    if hasattr(bar, "close"):
+        return float(bar.close)
+    if hasattr(bar, "close_price"):
+        return float(bar.close_price)
+    if hasattr(bar, "trade_price"):
+        return float(bar.trade_price)
+    if isinstance(bar, Mapping):
+        val = bar.get("close", bar.get("close_price", bar.get("price", bar.get("trade_price"))))
+        if val is not None:
+            return float(val)
+    raise SignalEvaluationError(f"cannot extract close price from bar: {bar!r}")
+
+
+def compute_realized_volatility(
+    completed_bars: Sequence[Any],
+    warmup_bars: int,
+    resolution_hours: int = 1,
+) -> tuple[float | None, str]:
+    """Compute rolling annualized realized volatility from completed bars.
+
+    Returns:
+        (volatility_annualized, status_message). If warmup is insufficient, returns (None, 'insufficient_warmup').
+    """
+    if len(completed_bars) < warmup_bars:
+        return None, f"insufficient_warmup: {len(completed_bars)} completed bars < {warmup_bars} required"
+
+    closes = [_extract_close_price(b) for b in completed_bars[-warmup_bars:]]
+    if len(closes) < 2:
+        return None, "not_enough_bars_for_returns"
+
+    returns: list[float] = []
+    for i in range(1, len(closes)):
+        prev = closes[i - 1]
+        curr = closes[i]
+        if prev <= 0 or curr <= 0:
+            return None, "non_positive_price_in_completed_bars"
+        returns.append(math.log(curr / prev))
+
+    if len(returns) < 2:
+        return None, "not_enough_returns"
+
+    stdev = statistics.stdev(returns)
+    bars_per_year = (365.25 * 24.0) / float(resolution_hours)
+    annualized_vol = stdev * math.sqrt(bars_per_year)
+    return annualized_vol, "ok"
+
+
+def compute_underlying_return(
+    completed_bars: Sequence[Any],
+    window_bars: int,
+) -> tuple[float | None, str]:
+    """Compute simple return over completed window of bars: (close_now - close_prev) / close_prev."""
+    if len(completed_bars) < window_bars + 1:
+        return None, f"insufficient_warmup: {len(completed_bars)} completed bars < {window_bars + 1} required"
+
+    closes = [_extract_close_price(b) for b in completed_bars[-(window_bars + 1):]]
+    first = closes[0]
+    last = closes[-1]
+    if first <= 0:
+        return None, "non_positive_price_in_return_window"
+    return (last - first) / first, "ok"
+
+
+def evaluate_signals(
+    config: Any,
+    history_asof: Any,
+    portfolio_view: Any,
+) -> Tuple[Signal, ...]:
+    """Pure, deterministic signal and calendar engine complying with SignalEvaluatorProtocol.
+
+    Parameters:
+        config: RunConfig, RunConfigDefinition, StrategyDefinition, or mapping.
+        history_asof: HistoryAsOf, mapping, or object with decision_at_ms and completed_bars.
+        portfolio_view: PortfolioState, mapping, or object with open_positions and cash_balance_btc.
+
+    Returns:
+        Tuple[Signal, ...] of emitted trade signals (empty tuple if gated or no signal).
+    """
+    # 1. Parse config and strategy
+    if hasattr(config, "strategy") and getattr(config, "strategy") is not None:
+        strat = config.strategy
+    else:
+        strat = config
+
+    strategy_name = str(getattr(strat, "name", getattr(config, "strategy_name", "unnamed_strategy"))).strip()
+    resolution_hours = int(getattr(config, "decision_resolution_hours", 1))
+    max_open_positions = int(getattr(config, "max_open_positions", 1))
+
+    entry_rules = getattr(strat, "entry_rules", ())
+    rule_params: dict[str, Any] = {}
+    rule_name = "enter_when_chain_has_required_legs"
+
+    if entry_rules:
+        primary_rule = entry_rules[0]
+        rule_name = getattr(primary_rule, "name", str(primary_rule))
+        params_raw = getattr(primary_rule, "parameters", {})
+        if isinstance(params_raw, Mapping):
+            rule_params = dict(params_raw)
+
+    # 2. Check for unsupported filters (e.g. IV, Open Interest)
+    for key in rule_params.keys():
+        key_clean = key.lower()
+        if key_clean in UNSUPPORTED_FILTERS or any(unsup in key_clean for unsup in UNSUPPORTED_FILTERS):
+            raise UnsupportedFilterError(
+                f"unsupported signal filter: {key!r} is not supported in V1; "
+                "historical IV/OI surface quotes are unavailable."
+            )
+
+    # 3. Parse history_asof
+    if isinstance(history_asof, HistoryAsOf):
+        t_ms = history_asof.decision_at_ms
+        raw_bars = history_asof.completed_bars
+        candidate_decision = history_asof.candidate_decision
+        candidate_instruments = history_asof.candidate_instruments
+    elif isinstance(history_asof, Mapping):
+        t_ms = int(history_asof.get("decision_at_ms", history_asof.get("as_of_time_ms", history_asof.get("t", 0))))
+        raw_bars = history_asof.get("completed_bars", history_asof.get("bars", ()))
+        candidate_decision = history_asof.get("candidate_decision")
+        candidate_instruments = history_asof.get("candidate_instruments", ())
+    else:
+        t_ms = int(getattr(history_asof, "decision_at_ms", getattr(history_asof, "as_of_time_ms", 0)))
+        raw_bars = getattr(history_asof, "completed_bars", getattr(history_asof, "bars", ()))
+        candidate_decision = getattr(history_asof, "candidate_decision", None)
+        candidate_instruments = getattr(history_asof, "candidate_instruments", ())
+
+    if t_ms <= 0:
+        raise SignalEvaluationError(f"invalid decision_at_ms: {t_ms}")
+
+    # Anti-lookahead: exclude any incomplete bar
+    completed_bars = [b for b in raw_bars if _is_bar_completed(b, t_ms)]
+
+    # 4. Parse portfolio_view
+    open_positions: Sequence[Position] = ()
+    closed_positions: Sequence[Position] = ()
+
+    if isinstance(portfolio_view, PortfolioState):
+        open_positions = portfolio_view.open_positions
+        closed_positions = portfolio_view.closed_positions
+    elif isinstance(portfolio_view, Mapping):
+        open_positions = portfolio_view.get("open_positions", ())
+        closed_positions = portfolio_view.get("closed_positions", ())
+    else:
+        open_positions = getattr(portfolio_view, "open_positions", ())
+        closed_positions = getattr(portfolio_view, "closed_positions", ())
+
+    # Filter active open positions (status == OPEN or not closed)
+    active_open = [
+        p for p in open_positions
+        if getattr(p, "status", PositionStatus.OPEN) == PositionStatus.OPEN and getattr(p, "closed_at_ms", None) is None
+    ]
+
+    # Gate A: Concurrent Position Limit (max-open gate)
+    if len(active_open) >= max_open_positions:
+        return ()
+
+    # Gate B: Duplicate Check at Same Timestamp
+    # If an open position was already opened at this exact decision_at_ms, suppress duplicate signal!
+    if any(getattr(p, "opened_at_ms", -1) == t_ms for p in active_open):
+        return ()
+
+    # Gate C: Cooldown Gate
+    cooldown_hours = float(rule_params.get("cooldown_hours", 0.0))
+    cooldown_bars = int(rule_params.get("cooldown_bars", 0))
+    cooldown_ms = int(cooldown_hours * HOUR_MS) if cooldown_hours > 0 else cooldown_bars * resolution_hours * HOUR_MS
+
+    if cooldown_ms > 0:
+        latest_event_ms = 0
+        for p in active_open:
+            latest_event_ms = max(latest_event_ms, getattr(p, "opened_at_ms", 0))
+        for p in closed_positions:
+            c_ms = getattr(p, "closed_at_ms", None) or getattr(p, "opened_at_ms", 0)
+            latest_event_ms = max(latest_event_ms, c_ms)
+
+        if latest_event_ms > 0 and (t_ms - latest_event_ms) < cooldown_ms:
+            return ()
+
+    # Gate D: Calendar Schedule Matching
+    schedule_type = str(rule_params.get("schedule_type", "")).strip().lower()
+    dt_utc = datetime.fromtimestamp(t_ms / 1000, tz=timezone.utc)
+
+    if schedule_type == "weekly" or rule_name == "weekly_calendar_entry":
+        # Target weekday: default 4 (Friday), target hour: default 8 (08:00 UTC)
+        target_day = rule_params.get("weekday", 4)
+        if isinstance(target_day, str):
+            day_map = {
+                "mon": 0, "monday": 0, "tue": 1, "tuesday": 1, "wed": 2, "wednesday": 2,
+                "thu": 3, "thursday": 3, "fri": 4, "friday": 4, "sat": 5, "saturday": 5,
+                "sun": 6, "sunday": 6,
+            }
+            target_day = day_map.get(target_day.lower(), 4)
+        target_hour = int(rule_params.get("hour_utc", 8))
+        if dt_utc.weekday() != target_day or dt_utc.hour != target_hour:
+            return ()
+
+    elif schedule_type == "daily" or rule_name == "daily_calendar_entry":
+        target_hour = int(rule_params.get("hour_utc", 8))
+        if dt_utc.hour != target_hour:
+            return ()
+
+    elif schedule_type == "every_n_bars" or "interval_bars" in rule_params:
+        interval_bars = int(rule_params.get("interval_bars", 24))
+        if interval_bars > 0:
+            bar_index = len(completed_bars)
+            if bar_index % interval_bars != 0:
+                return ()
+
+    # Gate E: Realized Volatility Filter
+    vol_filter_enabled = bool(rule_params.get("volatility_filter_enabled", False)) or (
+        "min_realized_vol" in rule_params or "max_realized_vol" in rule_params
+    )
+    if vol_filter_enabled:
+        warmup_bars = int(rule_params.get("warmup_bars", 24))
+        vol, status = compute_realized_volatility(completed_bars, warmup_bars, resolution_hours)
+        if vol is None:
+            # Warmup insufficient or data error -> gate blocks entry
+            return ()
+
+        min_vol = rule_params.get("min_realized_vol")
+        if min_vol is not None and vol < float(min_vol):
+            return ()
+        max_vol = rule_params.get("max_realized_vol")
+        if max_vol is not None and vol > float(max_vol):
+            return ()
+
+    # Gate F: Underlying Return Filter
+    return_filter_enabled = bool(rule_params.get("return_filter_enabled", False)) or (
+        "min_underlying_return" in rule_params or "max_underlying_return" in rule_params
+    )
+    if return_filter_enabled:
+        window_bars = int(rule_params.get("return_window_bars", 24))
+        ret, status = compute_underlying_return(completed_bars, window_bars)
+        if ret is None:
+            return ()
+
+        min_ret = rule_params.get("min_underlying_return")
+        if min_ret is not None and ret < float(min_ret):
+            return ()
+        max_ret = rule_params.get("max_underlying_return")
+        if max_ret is not None and ret > float(max_ret):
+            return ()
+
+    # 5. Extract target instruments and legs
+    instruments_to_trade: list[Instrument] = []
+    if candidate_decision is not None and candidate_decision.selected_instruments:
+        instruments_to_trade = list(candidate_decision.selected_instruments)
+    elif candidate_instruments:
+        instruments_to_trade = list(candidate_instruments)
+
+    # Gate G: DTE Gate (if instruments available)
+    min_dte = rule_params.get("min_dte_days")
+    max_dte = rule_params.get("max_dte_days")
+    if instruments_to_trade and (min_dte is not None or max_dte is not None):
+        for inst in instruments_to_trade:
+            dte_days = (inst.expiry_ms - t_ms) / float(DAY_MS)
+            if min_dte is not None and dte_days < float(min_dte):
+                return ()
+            if max_dte is not None and dte_days > float(max_dte):
+                return ()
+
+    # 6. Sizing and Quantities
+    legs = getattr(strat, "legs", ())
+    if instruments_to_trade:
+        inst_names = tuple(i.instrument_name for i in instruments_to_trade)
+        quantities: list[Decimal] = []
+        sides: list[Side] = []
+
+        for idx, inst in enumerate(instruments_to_trade):
+            # Match leg quantity and side if legs exist
+            if idx < len(legs):
+                leg = legs[idx]
+                q = Decimal(str(getattr(leg, "quantity", 1.0)))
+                s = Side.BUY if str(getattr(leg, "side", "long")).lower() in ("long", "buy") else Side.SELL
+            else:
+                q = Decimal("1.0")
+                s = Side.BUY
+            quantities.append(q)
+            sides.append(s)
+    else:
+        # Default placeholder signal for multi-leg entry evaluation
+        inst_names = (f"BTC-SYNTHETIC-{strategy_name}",)
+        quantities = [Decimal("1.0")]
+        sides = [Side.BUY]
+
+    # 7. Construct deterministic signal
+    signal_id = f"sig_{strategy_name}_{t_ms}"
+    signal_type = f"enter_{strategy_name}"
+
+    metadata_tuples: list[tuple[str, str]] = [
+        ("decision_at_ms", str(t_ms)),
+        ("strategy_name", strategy_name),
+        ("rule_name", rule_name),
+        ("completed_bars_count", str(len(completed_bars))),
+    ]
+    if vol_filter_enabled:
+        vol, _ = compute_realized_volatility(completed_bars, int(rule_params.get("warmup_bars", 24)), resolution_hours)
+        if vol is not None:
+            metadata_tuples.append(("realized_volatility_annualized", f"{vol:.4f}"))
+
+    signal = Signal(
+        signal_id=signal_id,
+        decision_at_ms=t_ms,
+        available_at_ms=t_ms,
+        strategy_name=strategy_name,
+        signal_type=signal_type,
+        instrument_names=inst_names,
+        target_quantities=tuple(quantities),
+        sides=tuple(sides),
+        reason_code=ReasonCode.ENTRY_SIGNAL,
+        metadata=tuple(metadata_tuples),
+    )
+
+    return (signal,)

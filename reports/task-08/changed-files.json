@@ -1,0 +1,32 @@
+[
+  {
+    "path": "strategies/strategy_schema.py",
+    "before_sha256": "15533f4cb7905139fa214f38e6f832a0bd5b71cb2465bddfcc75633c08ce144c",
+    "after_sha256": "5192ec5c9714fddf841e32c3c2e53f5172ce4308d214ead515024284eae5b0b7"
+  },
+  {
+    "path": "config/backtest_straddle_2024_2025.json",
+    "before_sha256": null,
+    "after_sha256": "1be2d08e698c9f2be62991a04c2b03a62e0f9acad9dda89d7ad5dc08c70104d4"
+  },
+  {
+    "path": "config/backtest_strangle_daily.json",
+    "before_sha256": null,
+    "after_sha256": "949a5c946d1880e71066b60013b9ba74c370a85678c7c93e596e1f8e424f29f2"
+  },
+  {
+    "path": "config/schema_run_config.json",
+    "before_sha256": null,
+    "after_sha256": "f8c43f3e0cd2c66417963740a7cfd2dd6323ed2745dd3edc6ab79e4cddd04a78"
+  },
+  {
+    "path": "tests/test_strategy_schema.py",
+    "before_sha256": "1f134196f0364301e2102fb4a1d8cd123abbe7a0613a4e629ad23f74d75ae9cb",
+    "after_sha256": "4cdbe8652091f2ee71d62a0e64bafc837f6bd724c114e5bd3449114603cbb63e"
+  },
+  {
+    "path": "tests/test_run_config.py",
+    "before_sha256": null,
+    "after_sha256": "1292ff48eb0cf13891a1b1605e424f142dc2e5a8125658da67703880f562fe32"
+  }
+]

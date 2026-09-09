@@ -1,0 +1,27 @@
+[
+  {
+    "path": "catalog/fees-btc-inverse.md",
+    "before_sha256": "bc5601cffad319aa21da4579443f614f8d45d8d159efa4789f4a96e24fddfb42",
+    "after_sha256": "89e5b79586a6bcba77a2b18206bdf5441ed9f91cdd0e9b9bd86954cb95a14a53"
+  },
+  {
+    "path": "ingestion/deribit_underlying.py",
+    "before_sha256": "adbdc8b639604fe31dc875f738385838f6ee0cd326e43361d734d36a3093d1fe",
+    "after_sha256": "d375f9275d0d4d4f2ed470a3ab5701a6dceb9d39433ba0af5b7e271aada31a6e"
+  },
+  {
+    "path": "ingestion/settlement.py",
+    "before_sha256": null,
+    "after_sha256": "d97dedb8dc53144c9964a6706110fe41682f0791d4072bb7fbf2f0d16fb3367f"
+  },
+  {
+    "path": "tests/test_deribit_underlying.py",
+    "before_sha256": "4bc3f90e21041cf41944da71b72eaf3586f0cc63426b262a21a4798eb78e1528",
+    "after_sha256": "513293b9e16e5b594df5ed7a368262f32fce6f9c7d4e4f1c230b9865e7d17d7b"
+  },
+  {
+    "path": "tests/test_settlement.py",
+    "before_sha256": null,
+    "after_sha256": "7ec3c3341caf09f9edf88a8478949006adb708b1a4f82506b62c9b7faa750958"
+  }
+]

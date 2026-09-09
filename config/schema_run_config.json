@@ -1,0 +1,457 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RunConfigSchema",
+  "description": "JSON Schema specification for Deribit BTC inverse options backtest RunConfig",
+  "type": "object",
+  "required": [
+    "strategy_name",
+    "start_time",
+    "end_time"
+  ],
+  "properties": {
+    "run_name": {
+      "type": "string"
+    },
+    "strategy_name": {
+      "type": "string"
+    },
+    "version": {
+      "type": "string"
+    },
+    "start_time": {
+      "type": "string",
+      "description": "UTC ISO 8601 start timestamp"
+    },
+    "end_time": {
+      "type": "string",
+      "description": "UTC ISO 8601 end timestamp"
+    },
+    "start_date": {
+      "type": "string"
+    },
+    "end_date": {
+      "type": "string"
+    },
+    "start_ms": {
+      "type": "integer"
+    },
+    "end_ms": {
+      "type": "integer"
+    },
+    "time_range": {
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 2,
+          "maxItems": 2
+        }
+      ]
+    },
+    "date_range": {
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "minItems": 2,
+          "maxItems": 2
+        }
+      ]
+    },
+    "decision_resolution": {
+      "type": "string",
+      "enum": [
+        "1h",
+        "1d"
+      ]
+    },
+    "decision_resolution_hours": {
+      "type": "integer",
+      "enum": [
+        1,
+        24
+      ]
+    },
+    "underlying": {
+      "type": "string",
+      "enum": [
+        "BTC"
+      ]
+    },
+    "settlement_currency": {
+      "type": "string",
+      "enum": [
+        "BTC"
+      ]
+    },
+    "contract_type": {
+      "type": "string",
+      "enum": [
+        "inverse"
+      ]
+    },
+    "initial_cash_btc": {
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "number"
+        }
+      ]
+    },
+    "initial_capital_btc": {
+      "oneOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "number"
+        }
+      ]
+    },
+    "sizing": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "fixed_quantity",
+            "premium_budget_btc",
+            "capital_fraction"
+          ]
+        },
+        "sizing_type": {
+          "type": "string",
+          "enum": [
+            "fixed_quantity",
+            "premium_budget_btc",
+            "capital_fraction"
+          ]
+        },
+        "value": {
+          "oneOf": [
+            {
+              "type": "number"
+            },
+            {
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "sizing_type": {
+      "type": "string",
+      "enum": [
+        "fixed_quantity",
+        "premium_budget_btc",
+        "capital_fraction"
+      ]
+    },
+    "sizing_value": {
+      "oneOf": [
+        {
+          "type": "number"
+        },
+        {
+          "type": "string"
+        }
+      ]
+    },
+    "quantity": {
+      "oneOf": [
+        {
+          "type": "number"
+        },
+        {
+          "type": "string"
+        }
+      ]
+    },
+    "max_open_positions": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "margin_model": {
+      "type": "string",
+      "enum": [
+        "conservative_stress_reserve",
+        "cash_secured"
+      ]
+    },
+    "stress_reserve_ratio": {
+      "oneOf": [
+        {
+          "type": "number"
+        },
+        {
+          "type": "string"
+        }
+      ]
+    },
+    "execution_profile": {
+      "type": "object",
+      "properties": {
+        "execution_model_id": {
+          "type": "string",
+          "enum": [
+            "model_a_bid_ask",
+            "model_b_mid_slippage",
+            "model_c_trade_match"
+          ]
+        },
+        "fee_rate_amount": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "number"
+            }
+          ]
+        },
+        "fee_cap_ratio": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "number"
+            }
+          ]
+        },
+        "slippage_btc": {
+          "oneOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "number"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "data_policy": {
+      "type": "object",
+      "properties": {
+        "allow_missing_bars": {
+          "type": "boolean"
+        },
+        "price_basis": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "strategy": {
+      "type": "object",
+      "required": [
+        "name",
+        "version",
+        "legs",
+        "entry_rules",
+        "exit_rules",
+        "fee_spread_model",
+        "result_metrics"
+      ],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        },
+        "legs": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "name",
+              "option_type",
+              "side",
+              "quantity"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "option_type": {
+                "type": "string",
+                "enum": [
+                  "call",
+                  "put"
+                ]
+              },
+              "side": {
+                "type": "string",
+                "enum": [
+                  "long",
+                  "short"
+                ]
+              },
+              "quantity": {
+                "type": "number",
+                "exclusiveMinimum": 0
+              },
+              "strike": {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "exact_usd",
+                      "atm",
+                      "moneyness_percent",
+                      "nearest_premium_usd",
+                      "same_strike_as"
+                    ]
+                  },
+                  "value": {}
+                },
+                "additionalProperties": false
+              },
+              "expiry": {
+                "type": "object",
+                "required": [
+                  "type"
+                ],
+                "properties": {
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "exact_date",
+                      "days_to_expiry",
+                      "nearest_days_to_expiry",
+                      "same_expiry_as"
+                    ]
+                  },
+                  "value": {}
+                },
+                "additionalProperties": false
+              },
+              "same_expiry_as": {
+                "type": "string"
+              },
+              "same_strike_as": {
+                "type": "string"
+              },
+              "strike_offset_usd": {
+                "type": "number"
+              }
+            },
+            "additionalProperties": false
+          },
+          "minItems": 1
+        },
+        "entry_rules": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "name"
+            ],
+            "properties": {
+              "name": {
+                "type": "string",
+                "enum": [
+                  "enter_when_chain_has_required_legs",
+                  "periodic_calendar_entry",
+                  "dte_target_entry",
+                  "signal_rule_entry",
+                  "rsi_oversold_filter"
+                ]
+              },
+              "parameters": {
+                "type": "object"
+              }
+            },
+            "additionalProperties": false
+          },
+          "minItems": 1
+        },
+        "exit_rules": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "type": "string",
+                "enum": [
+                  "net_usd_stop_loss",
+                  "net_usd_take_profit",
+                  "time_exit",
+                  "expiry_exit"
+                ]
+              },
+              "value": {}
+            },
+            "additionalProperties": false
+          },
+          "minItems": 1
+        },
+        "fee_spread_model": {
+          "type": "string",
+          "enum": [
+            "deribit_inverse_option_bid_ask",
+            "deribit_usdc_option_bid_ask",
+            "custom_bid_ask_slippage"
+          ]
+        },
+        "result_metrics": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "name",
+              "description"
+            ],
+            "properties": {
+              "name": {
+                "type": "string"
+              },
+              "description": {
+                "type": "string"
+              }
+            },
+            "additionalProperties": false
+          },
+          "minItems": 1
+        },
+        "notes": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "strategy_params": {
+      "type": "array"
+    },
+    "deterministic_seed": {
+      "type": "integer"
+    },
+    "schema_version": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": false
+}

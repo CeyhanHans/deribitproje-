@@ -1,0 +1,44 @@
+[
+  {
+    "path": "ingestion/deribit_history.py",
+    "before_sha256": "2eb02c5a9bf2c5fa1deabcd6200fa023cc98948394dca588b8022bf3305c18ae",
+    "after_sha256": "da97754aff39ece4cadf7a8945a4d7acf0641947c91d6e739c6a8d609d8bce4e",
+    "status": "modified"
+  },
+  {
+    "path": "ingestion/history_download.py",
+    "before_sha256": null,
+    "after_sha256": "8a59df4e5d1d083bbc8afc86f19b2f3a58d4f40152ca9cf326fe92069b21f487",
+    "status": "created"
+  },
+  {
+    "path": "tests/test_deribit_history.py",
+    "before_sha256": "813a6d7d7d33471c3838b18e84fd447bb6f502136e73e77c1aaf02fef8d7eecd",
+    "after_sha256": "b7e34769a1be0b28e72513e4058d234e31542877d04fdd05dc535bf1576e1647",
+    "status": "modified"
+  },
+  {
+    "path": "tests/test_history_download.py",
+    "before_sha256": null,
+    "after_sha256": "fc93c152b807948df9a8591c22fa921b237a10424d90907eea53a17f345c1225",
+    "status": "created"
+  },
+  {
+    "path": "reports/task-04/tests.txt",
+    "before_sha256": null,
+    "after_sha256": "69df6a6a251000f92b437980fbeb102661819a6857c3c637bbd90ef4671c631e",
+    "status": "created"
+  },
+  {
+    "path": "reports/task-04/changes.patch",
+    "before_sha256": null,
+    "after_sha256": "52a4931d3fa017a4305af87576e992f030498c4e29984dbbd7ab830cdd1d6eb2",
+    "status": "created"
+  },
+  {
+    "path": "reports/task-04/delivery.md",
+    "before_sha256": null,
+    "after_sha256": "62ea29ace9392c04f2e66a6388bab77045cc46bb57da760fcaf7bff08295b650",
+    "status": "created"
+  }
+]

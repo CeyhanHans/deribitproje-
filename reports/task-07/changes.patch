@@ -1,0 +1,850 @@
+diff --git a/ingestion/historical_windows.py b/ingestion/historical_windows.py
+index 2d15021..d29082d 100644
+--- a/ingestion/historical_windows.py
++++ b/ingestion/historical_windows.py
+@@ -12,11 +12,14 @@ from __future__ import annotations
+ 
+ import argparse
+ import json
++import math
+ from dataclasses import asdict, dataclass
+ from datetime import UTC, datetime, timedelta
++from decimal import Decimal
+ from pathlib import Path
+ from typing import Any, Iterable, Mapping, Sequence
+ 
++from core.contracts import DataQuality, PriceBasis, PriceObservation
+ from ingestion.deribit_history import (
+     DEFAULT_COUNT,
+     DEFAULT_MAX_PAGES,
+@@ -29,6 +32,8 @@ from ingestion.deribit_history import (
+ DEFAULT_WINDOWS_DAYS = (30, 60, 90, 120, 360)
+ DEFAULT_RESOLUTION = "1h"
+ HOUR_MS = 60 * 60 * 1000
++DAY_MS = 24 * 60 * 60 * 1000
++SUPPORTED_RESOLUTIONS = {"1h", "1d", "60", "1D"}
+ 
+ 
+ class HistoricalWindowError(ValueError):
+@@ -50,8 +55,10 @@ class HistoricalWindow:
+             raise HistoricalWindowError("timestamps must be non-negative")
+         if self.start_timestamp >= self.end_timestamp:
+             raise HistoricalWindowError("start_timestamp must be before end_timestamp")
+-        if self.resolution != DEFAULT_RESOLUTION:
+-            raise HistoricalWindowError("first version supports only 1h resolution")
++        if self.resolution not in SUPPORTED_RESOLUTIONS:
++            raise HistoricalWindowError(
++                f"unsupported resolution {self.resolution!r}: first version supports only 1h and 1d resolution"
++            )
+ 
+ 
+ @dataclass(frozen=True)
+@@ -67,6 +74,13 @@ class HourlyTradeBar:
+     volume_contracts: float
+     source: str = "deribit.public.historical_trades"
+     price_basis: str = "trade_price_not_historical_bid_ask"
++    first_trade_at: int | None = None
++    last_trade_at: int | None = None
++    available_at: int | None = None
++    resolution: str = "1h"
++
++
++TradeBar = HourlyTradeBar  # General alias for 1h or 1d trade bars
+ 
+ 
+ def utc_ms(value: datetime) -> int:
+@@ -118,43 +132,137 @@ def build_trade_plan_for_window(
+     )
+ 
+ 
+-def aggregate_hourly_trade_bars(
++def clean_and_dedup_trades(
+     trades: Iterable[Mapping[str, Any]],
+     *,
+-    instrument_name: str,
+-) -> tuple[HourlyTradeBar, ...]:
+-    """Aggregate Deribit trade rows into hourly OHLCV bars."""
+-    buckets: dict[int, list[tuple[int, float, float]]] = {}
++    instrument_name: str | None = None,
++) -> list[dict[str, Any]]:
++    """Validate, deduplicate by trade_id, and stably sort trades by (timestamp, trade_seq)."""
++    cleaned: list[dict[str, Any]] = []
++    seen_trade_ids: set[str] = set()
++
+     for trade in trades:
+-        row_instrument = str(trade.get("instrument_name", instrument_name))
+-        if row_instrument != instrument_name:
+-            continue
++        if instrument_name is not None:
++            row_instrument = str(trade.get("instrument_name", instrument_name))
++            if row_instrument != instrument_name:
++                continue
++
+         timestamp = _required_int(trade, "timestamp")
+         price = _required_float(trade, "price")
+         amount = _required_float(trade, "amount")
+-        bucket_start = timestamp - (timestamp % HOUR_MS)
+-        buckets.setdefault(bucket_start, []).append((timestamp, price, amount))
++
++        # Validate numeric bounds & reject NaN/Inf
++        if math.isnan(price) or math.isinf(price) or math.isnan(amount) or math.isinf(amount):
++            raise HistoricalWindowError("trade price and amount cannot be NaN or Infinity")
++        if price <= 0:
++            raise HistoricalWindowError(f"trade price must be strictly positive, got {price}")
++        if amount <= 0:
++            raise HistoricalWindowError(f"trade amount must be strictly positive (zero amount rejected), got {amount}")
++
++        # Deduplicate by trade_id / id
++        tid = str(trade.get("trade_id") or trade.get("id") or "")
++        if tid:
++            if tid in seen_trade_ids:
++                continue  # Duplicate trade; skip to prevent double counting volume
++            seen_trade_ids.add(tid)
++
++        trade_seq = int(trade.get("trade_seq", 0))
++        cleaned.append({
++            "timestamp": timestamp,
++            "trade_seq": trade_seq,
++            "price": price,
++            "amount": amount,
++            "trade_id": tid,
++            "instrument_name": str(trade.get("instrument_name", instrument_name or "")),
++        })
++
++    # Sort strictly by timestamp ascending, then trade_seq ascending
++    cleaned.sort(key=lambda t: (t["timestamp"], t["trade_seq"]))
++    return cleaned
++
++
++def aggregate_trade_bars(
++    trades: Iterable[Mapping[str, Any]],
++    *,
++    instrument_name: str,
++    resolution: str = "1h",
++) -> tuple[HourlyTradeBar, ...]:
++    """Aggregate Deribit trade rows into OHLCV bars (supports 1h and 1d).
++
++    Guarantees:
++    1. Stable sorting by (timestamp, trade_seq) for deterministic first/last trade times.
++    2. Deduplication by trade_id so volume is accurate.
++    3. OHLC close is only available at bucket_end (available_at = bucket_end).
++    4. First and last trade timestamps are recorded per bar.
++    """
++    cleaned_trades = clean_and_dedup_trades(trades, instrument_name=instrument_name)
++    resolution_ms = DAY_MS if resolution in ("1d", "1D", "24h") else HOUR_MS
++    res_str = "1d" if resolution in ("1d", "1D", "24h") else "1h"
++
++    buckets: dict[int, list[dict[str, Any]]] = {}
++    for trade in cleaned_trades:
++        ts = trade["timestamp"]
++        bucket_start = ts - (ts % resolution_ms)
++        buckets.setdefault(bucket_start, []).append(trade)
+ 
+     bars: list[HourlyTradeBar] = []
+     for bucket_start in sorted(buckets):
+-        rows = sorted(buckets[bucket_start], key=lambda item: item[0])
+-        prices = [row[1] for row in rows]
++        rows = buckets[bucket_start]
++        # Already sorted by (timestamp, trade_seq) from clean_and_dedup_trades
++        prices = [r["price"] for r in rows]
++        volumes = [r["amount"] for r in rows]
++        bucket_end = bucket_start + resolution_ms
++
+         bars.append(
+             HourlyTradeBar(
+                 instrument_name=instrument_name,
+                 bucket_start=bucket_start,
+-                bucket_end=bucket_start + HOUR_MS,
++                bucket_end=bucket_end,
+                 open=prices[0],
+                 high=max(prices),
+                 low=min(prices),
+                 close=prices[-1],
+                 trade_count=len(rows),
+-                volume_contracts=sum(row[2] for row in rows),
++                volume_contracts=sum(volumes),
++                source="deribit.public.historical_trades",
++                price_basis="trade_price_not_historical_bid_ask",
++                first_trade_at=rows[0]["timestamp"],
++                last_trade_at=rows[-1]["timestamp"],
++                available_at=bucket_end,  # OHLC close is only known at bucket_end
++                resolution=res_str,
+             )
+         )
+     return tuple(bars)
+ 
+ 
++def aggregate_hourly_trade_bars(
++    trades: Iterable[Mapping[str, Any]],
++    *,
++    instrument_name: str,
++) -> tuple[HourlyTradeBar, ...]:
++    """Aggregate Deribit trade rows into hourly OHLCV bars (backward-compatible)."""
++    return aggregate_trade_bars(trades, instrument_name=instrument_name, resolution="1h")
++
++
++def trade_bar_to_price_observation(
++    bar: HourlyTradeBar,
++    data_quality: DataQuality = DataQuality.OBSERVED_TRADE,
++) -> PriceObservation:
++    """Convert an HourlyTradeBar to an authoritative core.contracts.PriceObservation."""
++    return PriceObservation(
++        instrument_name=bar.instrument_name,
++        observed_at_ms=bar.bucket_end,
++        available_at_ms=bar.available_at or bar.bucket_end,
++        price_basis=PriceBasis.TRADE,
++        trade_price_btc=Decimal(str(bar.close)),
++        trade_size=Decimal(str(bar.volume_contracts)),
++        interval_start_ms=bar.bucket_start,
++        interval_end_ms=bar.bucket_end,
++        quality=data_quality,
++        source_ref=bar.source,
++    )
++
++
+ def fetch_hourly_trade_bars(
+     instrument_name: str,
+     window: HistoricalWindow,
+
+diff --git a/strategies/leg_matcher.py b/strategies/leg_matcher.py
+index 1b2cb29..362b5e5 100644
+--- a/strategies/leg_matcher.py
++++ b/strategies/leg_matcher.py
+@@ -1,12 +1,15 @@
+-"""Strict hourly multi-leg matching for historical option trade bars."""
++"""Strict multi-leg matching and calendar coverage for historical option trade bars."""
+ 
+ from __future__ import annotations
+ 
+ from dataclasses import dataclass
++from decimal import Decimal
++from enum import Enum
+ from types import MappingProxyType
+ from typing import Mapping, Sequence
+ 
+-from ingestion.historical_windows import HOUR_MS, HourlyTradeBar
++from core.contracts import CoverageReport
++from ingestion.historical_windows import DAY_MS, HOUR_MS, HourlyTradeBar
+ 
+ QUALITY_LABEL = "strict_trade_matched_no_stale_fill"
+ 
+@@ -15,11 +18,22 @@ class LegMatcherError(ValueError):
+     """Raised when leg bars cannot be safely matched."""
+ 
+ 
++class GapReason(str, Enum):
++    """Reason code for missing or unmatchable interval in a leg series."""
++    NO_TRADE = "observed_no_trade"
++    NOT_LISTED = "not_listed"
++    INCOMPLETE = "incomplete_download"
++    MALFORMED = "malformed"
++
++
+ @dataclass(frozen=True)
+ class LegCoverage:
+     observed_hours: int
+     missing_hours: int
+     instrument_name: str | None = None
++    eligible_hours: int = 0
++    coverage_ratio: float = 0.0
++    missing_reasons: Mapping[str, int] = MappingProxyType({})
+ 
+ 
+ @dataclass(frozen=True)
+@@ -30,6 +44,27 @@ class MatchedHourlyRow:
+     data_quality_label: str = QUALITY_LABEL
+ 
+ 
++@dataclass(frozen=True)
++class CalendarBucket:
++    """Full calendar timeline bucket, tracking both matched and missing legs."""
++    bucket_start: int
++    bucket_end: int
++    is_matched: bool
++    bars_by_leg: Mapping[str, HourlyTradeBar]
++    missing_legs: tuple[str, ...]
++    missing_reasons_by_leg: Mapping[str, str]
++
++
++@dataclass(frozen=True)
++class MissingIntervalEvent:
++    """Diagnostic event for missing bar(s) in an eligible calendar interval."""
++    bucket_start: int
++    bucket_end: int
++    missing_legs: tuple[str, ...]
++    reasons_by_leg: Mapping[str, str]
++    description: str
++
++
+ @dataclass(frozen=True)
+ class LegMatchMetrics:
+     eligible_hours: int
+@@ -44,6 +79,8 @@ class LegMatchMetrics:
+ class LegMatchResult:
+     rows: tuple[MatchedHourlyRow, ...]
+     metrics: LegMatchMetrics
++    calendar_grid: tuple[CalendarBucket, ...] = ()
++    missing_events: tuple[MissingIntervalEvent, ...] = ()
+ 
+ 
+ def match_hourly_trade_bars(
+@@ -52,12 +89,20 @@ def match_hourly_trade_bars(
+     window_start: int,
+     window_end: int,
+     expected_instruments: Mapping[str, str] | None = None,
++    min_legs: int = 1,
++    resolution_ms: int = HOUR_MS,
+ ) -> LegMatchResult:
+-    """Inner-join hourly bars across 2+ legs without carrying stale prices."""
+-    _validate_window(window_start, window_end)
++    """Match bars across 1..N legs without carrying stale prices, preserving full calendar grid.
++
++    Supports:
++    - Single leg (min_legs=1), 2 legs, and N legs (e.g. 4-leg Iron Condor).
++    - Hourly (1h) and Daily (1d) resolutions.
++    - Full calendar grid and missing events so open positions are not dropped during gaps.
++    """
++    _validate_window(window_start, window_end, resolution_ms=resolution_ms)
+     leg_names = tuple(bars_by_leg.keys())
+-    if len(leg_names) < 2:
+-        raise LegMatcherError("at least two legs are required")
++    if len(leg_names) < min_legs:
++        raise LegMatcherError(f"at least {min_legs} leg(s) required, got {len(leg_names)}")
+     if len(set(leg_names)) != len(leg_names):
+         raise LegMatcherError("leg names must be unique")
+ 
+@@ -68,7 +113,7 @@ def match_hourly_trade_bars(
+ 
+     indexed_by_leg: dict[str, dict[int, HourlyTradeBar]] = {}
+     coverage: dict[str, LegCoverage] = {}
+-    eligible_hours = (window_end - window_start) // HOUR_MS
++    eligible_intervals = (window_end - window_start) // resolution_ms
+ 
+     for leg_name in leg_names:
+         indexed = _index_leg_bars(
+@@ -77,42 +122,153 @@ def match_hourly_trade_bars(
+             window_start=window_start,
+             window_end=window_end,
+             expected_instrument=expected_instruments.get(leg_name),
++            resolution_ms=resolution_ms,
+         )
+         indexed_by_leg[leg_name] = indexed
+-        instrument_name = _single_instrument_name(indexed.values())
++        instrument_name = _single_instrument_name(indexed.values()) or expected_instruments.get(leg_name)
++        obs_count = len(indexed)
++        miss_count = eligible_intervals - obs_count
++        ratio = round(obs_count / eligible_intervals, 6) if eligible_intervals else 0.0
++        missing_reasons = {GapReason.NO_TRADE.value: miss_count} if miss_count > 0 else {}
++
+         coverage[leg_name] = LegCoverage(
+-            observed_hours=len(indexed),
+-            missing_hours=eligible_hours - len(indexed),
+-            instrument_name=instrument_name or expected_instruments.get(leg_name),
++            observed_hours=obs_count,
++            missing_hours=miss_count,
++            instrument_name=instrument_name,
++            eligible_hours=eligible_intervals,
++            coverage_ratio=ratio,
++            missing_reasons=MappingProxyType(missing_reasons),
+         )
+ 
+     rows: list[MatchedHourlyRow] = []
+-    for bucket_start in range(window_start, window_end, HOUR_MS):
++    calendar_grid: list[CalendarBucket] = []
++    missing_events: list[MissingIntervalEvent] = []
++
++    for bucket_start in range(window_start, window_end, resolution_ms):
++        bucket_end = bucket_start + resolution_ms
+         selected: dict[str, HourlyTradeBar] = {}
++        missing_legs: list[str] = []
++        reasons_by_leg: dict[str, str] = {}
++
+         for leg_name in leg_names:
+             bar = indexed_by_leg[leg_name].get(bucket_start)
+             if bar is None:
+-                selected = {}
+-                break
+-            selected[leg_name] = bar
+-        if selected:
+-            rows.append(
+-                MatchedHourlyRow(
++                missing_legs.append(leg_name)
++                reasons_by_leg[leg_name] = GapReason.NO_TRADE.value
++            else:
++                selected[leg_name] = bar
++
++        if not missing_legs:
++            # All legs traded in this bucket
++            row = MatchedHourlyRow(
++                bucket_start=bucket_start,
++                bucket_end=bucket_end,
++                bars_by_leg=MappingProxyType(dict(selected)),
++            )
++            rows.append(row)
++            calendar_grid.append(
++                CalendarBucket(
++                    bucket_start=bucket_start,
++                    bucket_end=bucket_end,
++                    is_matched=True,
++                    bars_by_leg=MappingProxyType(dict(selected)),
++                    missing_legs=(),
++                    missing_reasons_by_leg=MappingProxyType({}),
++                )
++            )
++        else:
++            # One or more legs missing: record calendar bucket and missing event
++            evt = MissingIntervalEvent(
++                bucket_start=bucket_start,
++                bucket_end=bucket_end,
++                missing_legs=tuple(missing_legs),
++                reasons_by_leg=MappingProxyType(reasons_by_leg),
++                description=f"Missing trade(s) for leg(s): {', '.join(missing_legs)}",
++            )
++            missing_events.append(evt)
++            calendar_grid.append(
++                CalendarBucket(
+                     bucket_start=bucket_start,
+-                    bucket_end=bucket_start + HOUR_MS,
++                    bucket_end=bucket_end,
++                    is_matched=False,
+                     bars_by_leg=MappingProxyType(dict(selected)),
++                    missing_legs=tuple(missing_legs),
++                    missing_reasons_by_leg=MappingProxyType(reasons_by_leg),
+                 )
+             )
+ 
+     matched_hours = len(rows)
+     metrics = LegMatchMetrics(
+-        eligible_hours=eligible_hours,
++        eligible_hours=eligible_intervals,
+         matched_hours=matched_hours,
+-        skipped_hours=eligible_hours - matched_hours,
++        skipped_hours=eligible_intervals - matched_hours,
+         per_leg_coverage=MappingProxyType(dict(coverage)),
+-        liquidity_coverage_ratio=matched_hours / eligible_hours if eligible_hours else 0.0,
++        liquidity_coverage_ratio=matched_hours / eligible_intervals if eligible_intervals else 0.0,
++    )
++    return LegMatchResult(
++        rows=tuple(rows),
++        metrics=metrics,
++        calendar_grid=tuple(calendar_grid),
++        missing_events=tuple(missing_events),
+     )
+-    return LegMatchResult(rows=tuple(rows), metrics=metrics)
++
++
++def match_two_plus_legs(
++    bars_by_leg: Mapping[str, Sequence[HourlyTradeBar]],
++    *,
++    window_start: int,
++    window_end: int,
++    expected_instruments: Mapping[str, str] | None = None,
++) -> LegMatchResult:
++    """Legacy compatibility function strictly requiring 2+ legs."""
++    if len(bars_by_leg) < 2:
++        raise LegMatcherError("at least two legs are required")
++    return match_hourly_trade_bars(
++        bars_by_leg,
++        window_start=window_start,
++        window_end=window_end,
++        expected_instruments=expected_instruments,
++        min_legs=2,
++    )
++
++
++def has_simultaneous_trades(row: MatchedHourlyRow) -> bool:
++    """Check if all legs in a matched row traded at the exact same timestamp.
++
++    Historical trade bars preserve actual trade execution times (first_trade_at,
++    last_trade_at). Different legs typically trade at different times within
++    the hour; they must not be mislabeled as simultaneous bid/ask quotes.
++    """
++    trade_times = {
++        bar.last_trade_at if bar.last_trade_at is not None else bar.bucket_start
++        for bar in row.bars_by_leg.values()
++    }
++    return len(trade_times) == 1
++
++
++def to_contract_coverage_reports(
++    result: LegMatchResult,
++    window_start: int,
++    window_end: int,
++) -> tuple[CoverageReport, ...]:
++    """Convert per-leg coverage into immutable core.contracts.CoverageReport objects."""
++    reports: list[CoverageReport] = []
++    for leg_name, cov in result.metrics.per_leg_coverage.items():
++        instrument = cov.instrument_name or leg_name
++        reports.append(
++            CoverageReport(
++                instrument_name=instrument,
++                start_ms=window_start,
++                end_ms=window_end,
++                expected_intervals=cov.eligible_hours,
++                observed_intervals=cov.observed_hours,
++                missing_intervals=cov.missing_hours,
++                coverage_ratio=Decimal(str(cov.coverage_ratio)),
++                quality_breakdown=tuple((k, v) for k, v in cov.missing_reasons.items()),
++                status="complete" if cov.missing_hours == 0 else "incomplete",
++            )
++        )
++    return tuple(reports)
+ 
+ 
+ def _index_leg_bars(
+@@ -122,12 +278,13 @@ def _index_leg_bars(
+     window_start: int,
+     window_end: int,
+     expected_instrument: str | None,
++    resolution_ms: int = HOUR_MS,
+ ) -> dict[int, HourlyTradeBar]:
+     indexed: dict[int, HourlyTradeBar] = {}
+     instruments: set[str] = set()
+ 
+     for bar in bars:
+-        _validate_bar_alignment(leg_name, bar)
++        _validate_bar_alignment(leg_name, bar, resolution_ms=resolution_ms)
+         if bar.bucket_start < window_start or bar.bucket_start >= window_end:
+             continue
+         if bar.bucket_start in indexed:
+@@ -142,19 +299,19 @@ def _index_leg_bars(
+     return indexed
+ 
+ 
+-def _validate_window(window_start: int, window_end: int) -> None:
++def _validate_window(window_start: int, window_end: int, resolution_ms: int = HOUR_MS) -> None:
+     if window_start < 0 or window_end < 0:
+         raise LegMatcherError("window timestamps must be non-negative")
+     if window_start >= window_end:
+         raise LegMatcherError("window_start must be before window_end")
+-    if window_start % HOUR_MS != 0 or window_end % HOUR_MS != 0:
+-        raise LegMatcherError("window boundaries must be exact hourly buckets")
++    if window_start % resolution_ms != 0 or window_end % resolution_ms != 0:
++        raise LegMatcherError("window boundaries must be exact bucket intervals")
+ 
+ 
+-def _validate_bar_alignment(leg_name: str, bar: HourlyTradeBar) -> None:
+-    if bar.bucket_start % HOUR_MS != 0:
++def _validate_bar_alignment(leg_name: str, bar: HourlyTradeBar, resolution_ms: int = HOUR_MS) -> None:
++    if bar.bucket_start % resolution_ms != 0:
+         raise LegMatcherError(f"misaligned bucket_start for leg {leg_name}")
+-    if bar.bucket_end != bar.bucket_start + HOUR_MS:
++    if bar.bucket_end != bar.bucket_start + resolution_ms:
+         raise LegMatcherError(f"misaligned bucket_end for leg {leg_name}")
+ 
+ 
+@@ -163,3 +320,4 @@ def _single_instrument_name(bars: Sequence[HourlyTradeBar]) -> str | None:
+     if not instruments:
+         return None
+     return next(iter(instruments))
++
+
+diff --git a/tests/test_historical_windows.py b/tests/test_historical_windows.py
+index 423c8f6..9a9b896 100644
+--- a/tests/test_historical_windows.py
++++ b/tests/test_historical_windows.py
+@@ -2,17 +2,25 @@ import json
+ import tempfile
+ import unittest
+ from datetime import UTC, datetime
++import math
++from decimal import Decimal
+ from pathlib import Path
+ from unittest.mock import patch
+ 
++from core.contracts import PriceBasis, PriceObservation
+ from ingestion.historical_windows import (
++    DAY_MS,
+     HOUR_MS,
+     HistoricalWindow,
+     HistoricalWindowError,
++    HourlyTradeBar,
+     aggregate_hourly_trade_bars,
++    aggregate_trade_bars,
+     build_default_windows,
+     build_trade_plan_for_window,
++    clean_and_dedup_trades,
+     fetch_hourly_trade_bars,
++    trade_bar_to_price_observation,
+     utc_ms,
+     write_window_bars_json,
+ )
+@@ -114,6 +122,106 @@ class HistoricalWindowsTests(unittest.TestCase):
+ 
+         self.assertEqual(saved, payload)
+ 
++    def test_sequence_ordering_with_equal_timestamps_and_disordered_trades(self):
++        # Disordered trades arriving with both different timestamps and same timestamp with different sequence numbers
++        start = utc_ms(datetime(2026, 9, 9, 1, 0, tzinfo=UTC))
++        raw_trades = [
++            {"instrument_name": "BTC-TEST-C", "timestamp": start + 500, "trade_seq": 3, "price": 0.013, "amount": 1},
++            {"instrument_name": "BTC-TEST-C", "timestamp": start + 100, "trade_seq": 1, "price": 0.010, "amount": 2},
++            {"instrument_name": "BTC-TEST-C", "timestamp": start + 500, "trade_seq": 2, "price": 0.012, "amount": 1},
++        ]
++        bars = aggregate_hourly_trade_bars(raw_trades, instrument_name="BTC-TEST-C")
++        self.assertEqual(len(bars), 1)
++        bar = bars[0]
++        # Open should be trade with timestamp start+100 (price 0.010)
++        self.assertEqual(bar.open, 0.010)
++        # Close should be trade with timestamp start+500, trade_seq=3 (price 0.013)
++        self.assertEqual(bar.close, 0.013)
++        self.assertEqual(bar.first_trade_at, start + 100)
++        self.assertEqual(bar.last_trade_at, start + 500)
++        self.assertEqual(bar.available_at, start + HOUR_MS)
++
++    def test_deduplication_by_trade_id_preserves_volume_accuracy(self):
++        start = utc_ms(datetime(2026, 9, 9, 1, 0, tzinfo=UTC))
++        raw_trades = [
++            {"instrument_name": "BTC-TEST-C", "timestamp": start + 100, "trade_id": "T1", "price": 0.010, "amount": 5.0},
++            {"instrument_name": "BTC-TEST-C", "timestamp": start + 100, "trade_id": "T1", "price": 0.010, "amount": 5.0}, # Exact duplicate!
++            {"instrument_name": "BTC-TEST-C", "timestamp": start + 200, "trade_id": "T2", "price": 0.011, "amount": 3.0},
++        ]
++        bars = aggregate_hourly_trade_bars(raw_trades, instrument_name="BTC-TEST-C")
++        self.assertEqual(len(bars), 1)
++        bar = bars[0]
++        # Volume must be strictly 8.0 (5.0 + 3.0), not 13.0!
++        self.assertEqual(bar.volume_contracts, 8.0)
++        self.assertEqual(bar.trade_count, 2)
++
++    def test_rejects_zero_or_negative_amount_and_nan_or_inf(self):
++        start = utc_ms(datetime(2026, 9, 9, 1, 0, tzinfo=UTC))
++
++        # Zero amount
++        with self.assertRaisesRegex(HistoricalWindowError, "strictly positive"):
++            clean_and_dedup_trades([{"timestamp": start, "price": 0.01, "amount": 0.0}])
++
++        # Negative amount
++        with self.assertRaisesRegex(HistoricalWindowError, "strictly positive"):
++            clean_and_dedup_trades([{"timestamp": start, "price": 0.01, "amount": -1.0}])
++
++        # Negative price
++        with self.assertRaisesRegex(HistoricalWindowError, "strictly positive"):
++            clean_and_dedup_trades([{"timestamp": start, "price": -0.01, "amount": 1.0}])
++
++        # NaN price
++        with self.assertRaisesRegex(HistoricalWindowError, "NaN or Infinity"):
++            clean_and_dedup_trades([{"timestamp": start, "price": float("nan"), "amount": 1.0}])
++
++        # Inf amount
++        with self.assertRaisesRegex(HistoricalWindowError, "NaN or Infinity"):
++            clean_and_dedup_trades([{"timestamp": start, "price": 0.01, "amount": float("inf")}])
++
++    def test_daily_resolution_aggregation(self):
++        start = utc_ms(datetime(2026, 9, 9, 0, 0, tzinfo=UTC))
++        raw_trades = [
++            {"instrument_name": "BTC-TEST-C", "timestamp": start + 3600_000, "price": 0.010, "amount": 2.0},
++            {"instrument_name": "BTC-TEST-C", "timestamp": start + 7200_000, "price": 0.015, "amount": 3.0},
++            {"instrument_name": "BTC-TEST-C", "timestamp": start + 80_000_000, "price": 0.012, "amount": 1.0},
++        ]
++        bars = aggregate_trade_bars(raw_trades, instrument_name="BTC-TEST-C", resolution="1d")
++        self.assertEqual(len(bars), 1)
++        bar = bars[0]
++        self.assertEqual(bar.bucket_start, start)
++        self.assertEqual(bar.bucket_end, start + DAY_MS)
++        self.assertEqual(bar.open, 0.010)
++        self.assertEqual(bar.high, 0.015)
++        self.assertEqual(bar.close, 0.012)
++        self.assertEqual(bar.volume_contracts, 6.0)
++        self.assertEqual(bar.resolution, "1d")
++
++    def test_trade_bar_to_price_observation_adapter(self):
++        start = utc_ms(datetime(2026, 9, 9, 1, 0, tzinfo=UTC))
++        bar = HourlyTradeBar(
++            instrument_name="BTC-TEST-C",
++            bucket_start=start,
++            bucket_end=start + HOUR_MS,
++            open=0.010,
++            high=0.012,
++            low=0.009,
++            close=0.011,
++            trade_count=3,
++            volume_contracts=10.0,
++            first_trade_at=start + 100,
++            last_trade_at=start + 500,
++            available_at=start + HOUR_MS,
++        )
++        obs = trade_bar_to_price_observation(bar)
++        self.assertIsInstance(obs, PriceObservation)
++        self.assertEqual(obs.instrument_name, "BTC-TEST-C")
++        self.assertEqual(obs.interval_start_ms, start)
++        self.assertEqual(obs.interval_end_ms, start + HOUR_MS)
++        self.assertEqual(obs.available_at_ms, start + HOUR_MS)
++        self.assertEqual(obs.trade_price_btc, Decimal("0.011"))
++        self.assertEqual(obs.trade_size, Decimal("10"))
++        self.assertEqual(obs.price_basis, PriceBasis.TRADE)
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+
+diff --git a/tests/test_leg_matcher.py b/tests/test_leg_matcher.py
+index 1c18a20..0411806 100644
+--- a/tests/test_leg_matcher.py
++++ b/tests/test_leg_matcher.py
+@@ -2,7 +2,14 @@ import unittest
+ from datetime import UTC, datetime
+ 
+ from ingestion.historical_windows import HOUR_MS, HourlyTradeBar, utc_ms
+-from strategies.leg_matcher import LegMatcherError, match_hourly_trade_bars
++from strategies.leg_matcher import (
++    GapReason,
++    LegMatcherError,
++    has_simultaneous_trades,
++    match_hourly_trade_bars,
++    match_two_plus_legs,
++    to_contract_coverage_reports,
++)
+ 
+ 
+ START = utc_ms(datetime(2026, 9, 1, 0, 0, tzinfo=UTC))
+@@ -145,6 +152,150 @@ class LegMatcherTests(unittest.TestCase):
+                 expected_instruments={"call_leg": "BTC-TEST-C"},
+             )
+ 
++    def test_single_leg_matching(self):
++        # Single leg matching must succeed and produce full coverage metrics
++        result = match_hourly_trade_bars(
++            {"single_call": [bar("BTC-TEST-C", 0), bar("BTC-TEST-C", 1), bar("BTC-TEST-C", 2)]},
++            window_start=START,
++            window_end=START + 3 * HOUR_MS,
++            min_legs=1,
++        )
++        self.assertEqual(len(result.rows), 3)
++        self.assertEqual(result.metrics.eligible_hours, 3)
++        self.assertEqual(result.metrics.matched_hours, 3)
++        self.assertEqual(result.metrics.skipped_hours, 0)
++        self.assertEqual(result.metrics.liquidity_coverage_ratio, 1.0)
++        self.assertEqual(result.metrics.per_leg_coverage["single_call"].observed_hours, 3)
++
++    def test_four_leg_matching(self):
++        # 4 legs (Iron Condor: c1, c2, p1, p2)
++        # Hour 0: all 4 present -> matched
++        # Hour 1: p2 missing -> skipped
++        # Hour 2: all 4 present -> matched
++        result = match_hourly_trade_bars(
++            {
++                "call_short": [bar("BTC-C1", 0), bar("BTC-C1", 1), bar("BTC-C1", 2)],
++                "call_long":  [bar("BTC-C2", 0), bar("BTC-C2", 1), bar("BTC-C2", 2)],
++                "put_short":  [bar("BTC-P1", 0), bar("BTC-P1", 1), bar("BTC-P1", 2)],
++                "put_long":   [bar("BTC-P2", 0), bar("BTC-P2", 2)],  # Missing at hour 1
++            },
++            window_start=START,
++            window_end=START + 3 * HOUR_MS,
++            min_legs=1,
++        )
++        self.assertEqual(len(result.rows), 2)
++        self.assertEqual([r.bucket_start for r in result.rows], [START, START + 2 * HOUR_MS])
++        self.assertEqual(result.metrics.eligible_hours, 3)
++        self.assertEqual(result.metrics.matched_hours, 2)
++        self.assertEqual(result.metrics.skipped_hours, 1)
++        self.assertEqual(result.metrics.per_leg_coverage["put_long"].missing_hours, 1)
++
++    def test_empty_hour_calendar_grid_and_missing_events(self):
++        # Empty hour where no legs traded must not be silently dropped:
++        # it is tracked in calendar_grid and missing_events so open positions are not lost.
++        result = match_hourly_trade_bars(
++            {
++                "call_leg": [bar("BTC-TEST-C", 0), bar("BTC-TEST-C", 2)],
++                "put_leg":  [bar("BTC-TEST-P", 0), bar("BTC-TEST-P", 2)],
++            },
++            window_start=START,
++            window_end=START + 3 * HOUR_MS,
++        )
++        # 3 calendar buckets total
++        self.assertEqual(len(result.calendar_grid), 3)
++        # Bucket 0: matched
++        self.assertTrue(result.calendar_grid[0].is_matched)
++        # Bucket 1: empty hour (missing both legs)
++        self.assertFalse(result.calendar_grid[1].is_matched)
++        self.assertEqual(set(result.calendar_grid[1].missing_legs), {"call_leg", "put_leg"})
++        # Bucket 2: matched
++        self.assertTrue(result.calendar_grid[2].is_matched)
++
++        # Missing event recorded
++        self.assertEqual(len(result.missing_events), 1)
++        self.assertEqual(result.missing_events[0].bucket_start, START + HOUR_MS)
++
++    def test_independent_denominator_per_leg(self):
++        # Leg A: 3 observed hours. Leg B: 1 observed hour.
++        # Eligible denominator is 4 for both, but observed and coverage_ratio are strictly independent.
++        result = match_hourly_trade_bars(
++            {
++                "leg_a": [bar("BTC-A", 0), bar("BTC-A", 1), bar("BTC-A", 2)],
++                "leg_b": [bar("BTC-B", 0)],
++            },
++            window_start=START,
++            window_end=START + 4 * HOUR_MS,
++        )
++        cov_a = result.metrics.per_leg_coverage["leg_a"]
++        cov_b = result.metrics.per_leg_coverage["leg_b"]
++
++        self.assertEqual(cov_a.eligible_hours, 4)
++        self.assertEqual(cov_a.observed_hours, 3)
++        self.assertEqual(cov_a.missing_hours, 1)
++        self.assertEqual(cov_a.coverage_ratio, 0.75)
++
++        self.assertEqual(cov_b.eligible_hours, 4)
++        self.assertEqual(cov_b.observed_hours, 1)
++        self.assertEqual(cov_b.missing_hours, 3)
++        self.assertEqual(cov_b.coverage_ratio, 0.25)
++
++    def test_distinct_trade_times_within_hour_not_labeled_simultaneous_quotes(self):
++        # Leg 1 traded at minute 10, Leg 2 traded at minute 50
++        bar1 = HourlyTradeBar(
++            instrument_name="BTC-C",
++            bucket_start=START,
++            bucket_end=START + HOUR_MS,
++            open=0.01, high=0.01, low=0.01, close=0.01,
++            trade_count=1, volume_contracts=1.0,
++            first_trade_at=START + 600_000,
++            last_trade_at=START + 600_000,  # Minute 10
++        )
++        bar2 = HourlyTradeBar(
++            instrument_name="BTC-P",
++            bucket_start=START,
++            bucket_end=START + HOUR_MS,
++            open=0.02, high=0.02, low=0.02, close=0.02,
++            trade_count=1, volume_contracts=1.0,
++            first_trade_at=START + 3_000_000,
++            last_trade_at=START + 3_000_000,  # Minute 50
++        )
++        result = match_hourly_trade_bars(
++            {"call_leg": [bar1], "put_leg": [bar2]},
++            window_start=START,
++            window_end=START + HOUR_MS,
++        )
++        self.assertEqual(len(result.rows), 1)
++        row = result.rows[0]
++        # Invariant: Distinct trade timestamps within the hour must NOT be labeled simultaneous quotes!
++        self.assertFalse(has_simultaneous_trades(row))
++
++    def test_legacy_two_plus_matcher_compatibility(self):
++        # match_two_plus_legs strictly enforces 2+ legs
++        with self.assertRaisesRegex(LegMatcherError, "at least two legs are required"):
++            match_two_plus_legs(
++                {"single_call": [bar("BTC-TEST-C", 0)]},
++                window_start=START,
++                window_end=START + HOUR_MS,
++            )
++
++    def test_to_contract_coverage_reports_conversion(self):
++        result = match_hourly_trade_bars(
++            {
++                "call_leg": [bar("BTC-TEST-C", 0)],
++                "put_leg": [bar("BTC-TEST-P", 0)],
++            },
++            window_start=START,
++            window_end=START + 2 * HOUR_MS,
++            expected_instruments={"call_leg": "BTC-TEST-C", "put_leg": "BTC-TEST-P"},
++        )
++        reports = to_contract_coverage_reports(result, START, START + 2 * HOUR_MS)
++        self.assertEqual(len(reports), 2)
++        call_rep = next(r for r in reports if r.instrument_name == "BTC-TEST-C")
++        self.assertEqual(call_rep.expected_intervals, 2)
++        self.assertEqual(call_rep.observed_intervals, 1)
++        self.assertEqual(call_rep.missing_intervals, 1)
++        self.assertEqual(call_rep.status, "incomplete")
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

@@ -1,14 +1,18 @@
+import io
 import json
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
+from urllib.error import HTTPError, URLError
 
 from ingestion.deribit_history import (
     DEFAULT_BASE_URL,
     DEFAULT_COUNT,
     MAX_COUNT,
     DeribitHistoryError,
+    TradeDownloadPlan,
     build_sequence_plan,
     build_time_plan,
+    fetch_deribit_json,
     fetch_trade_pages,
     planned_requests,
     summarize_download,
@@ -16,8 +20,9 @@ from ingestion.deribit_history import (
 
 
 class FakeResponse:
-    def __init__(self, payload):
+    def __init__(self, payload, byte_content: bytes | None = None):
         self.payload = payload
+        self.byte_content = byte_content
 
     def __enter__(self):
         return self
@@ -26,6 +31,8 @@ class FakeResponse:
         return False
 
     def read(self):
+        if self.byte_content is not None:
+            return self.byte_content
         return json.dumps(self.payload).encode("utf-8")
 
 
@@ -141,6 +148,135 @@ class DeribitHistoryTests(unittest.TestCase):
     def test_rejects_count_above_official_limit(self):
         with self.assertRaisesRegex(ValueError, "count must be <= 1000"):
             build_sequence_plan("BTC-TEST", 1, 1001, count=1001)
+
+    # --------------------------------------------------------------------------
+    # Additional Resiliency, Timeout, 429, and Budget Tests
+    # --------------------------------------------------------------------------
+
+    def test_http_429_retry_after_respected(self):
+        """HTTP 429 with Retry-After header backs off and succeeds on retry."""
+        err_429 = HTTPError(
+            url="http://test",
+            code=429,
+            msg="Too Many Requests",
+            hdrs={"Retry-After": "3.5"},
+            fp=None,
+        )
+        success = FakeResponse({"result": {"trades": [{"trade_seq": 1}], "has_more": False}})
+        sleep_calls = []
+
+        try:
+            with patch("ingestion.deribit_history.urlopen", side_effect=[err_429, success]):
+                result, byte_size = fetch_deribit_json(
+                    DEFAULT_BASE_URL,
+                    "/get_last_trades_by_instrument",
+                    {"instrument_name": "BTC-TEST"},
+                    max_retries=3,
+                    sleeper=lambda s: sleep_calls.append(s),
+                )
+        finally:
+            err_429.close()
+
+        self.assertEqual(len(sleep_calls), 1)
+        self.assertEqual(sleep_calls[0], 3.5)
+        self.assertEqual(len(result["trades"]), 1)
+
+    def test_retry_exhaustion_raises_deribit_history_error(self):
+        """When retries are exhausted after max_retries attempts, raises DeribitHistoryError."""
+        err = URLError("Temporary connection failure")
+        sleep_calls = []
+
+        with patch("ingestion.deribit_history.urlopen", side_effect=err):
+            with self.assertRaisesRegex(DeribitHistoryError, "after 3 retries"):
+                fetch_deribit_json(
+                    DEFAULT_BASE_URL,
+                    "/get_last_trades_by_instrument",
+                    {"instrument_name": "BTC-TEST"},
+                    max_retries=3,
+                    sleeper=lambda s: sleep_calls.append(s),
+                )
+
+        self.assertEqual(len(sleep_calls), 2)  # Slept before attempt 2 and attempt 3
+
+    def test_server_error_500_retries_with_exponential_backoff(self):
+        """HTTP 500 server error retries with exponential backoff and succeeds."""
+        err_500_1 = HTTPError(url="http://test", code=500, msg="Internal Server Error", hdrs={}, fp=None)
+        err_500_2 = HTTPError(url="http://test", code=500, msg="Internal Server Error", hdrs={}, fp=None)
+        success = FakeResponse({"result": {"trades": [{"trade_seq": 42}], "has_more": False}})
+        sleep_calls = []
+
+        try:
+            with patch("ingestion.deribit_history.urlopen", side_effect=[err_500_1, err_500_2, success]):
+                result, _ = fetch_deribit_json(
+                    DEFAULT_BASE_URL,
+                    "/get_last_trades_by_instrument",
+                    {"instrument_name": "BTC-TEST"},
+                    max_retries=5,
+                    backoff_factor=1.0,
+                    sleeper=lambda s: sleep_calls.append(s),
+                )
+        finally:
+            err_500_1.close()
+            err_500_2.close()
+
+        self.assertEqual(len(sleep_calls), 2)
+        self.assertEqual(sleep_calls[0], 1.0)  # 1.0 * (2^0)
+        self.assertEqual(sleep_calls[1], 2.0)  # 1.0 * (2^1)
+        self.assertEqual(result["trades"][0]["trade_seq"], 42)
+
+    def test_http_400_is_non_retryable(self):
+        """HTTP 400 Bad Request immediately fails without wasting retries."""
+        err_400 = HTTPError(
+            url="http://test",
+            code=400,
+            msg="Bad Request",
+            hdrs={},
+            fp=None,
+        )
+        sleep_calls = []
+
+        try:
+            with patch("ingestion.deribit_history.urlopen", side_effect=err_400):
+                with self.assertRaisesRegex(DeribitHistoryError, "HTTP 400"):
+                    fetch_deribit_json(
+                        DEFAULT_BASE_URL,
+                        "/get_last_trades_by_instrument",
+                        {"instrument_name": "BTC-TEST"},
+                        max_retries=5,
+                        sleeper=lambda s: sleep_calls.append(s),
+                    )
+        finally:
+            err_400.close()
+
+        self.assertEqual(len(sleep_calls), 0)  # Zero retries attempted
+
+    def test_budget_cap_max_bytes(self):
+        """fetch_trade_pages respects max_bytes limit."""
+        plan = build_sequence_plan("BTC-TEST", 1, 100, count=10, max_pages=10, max_bytes=50)
+        # Each page response has byte size ~ 80 bytes
+        payload = {"result": {"trades": [{"trade_seq": i} for i in range(10)], "has_more": True}}
+
+        with patch("ingestion.deribit_history.urlopen", return_value=FakeResponse(payload)):
+            pages = fetch_trade_pages(plan)
+
+        # After page 1, total_bytes >= 50, so page 2 is not fetched!
+        self.assertEqual(len(pages), 1)
+
+    def test_budget_cap_max_seconds(self):
+        """fetch_trade_pages respects max_seconds limit."""
+        plan = build_sequence_plan("BTC-TEST", 1, 100, count=10, max_pages=10, max_seconds=0.001)
+        payload = {"result": {"trades": [{"trade_seq": 1}], "has_more": True}}
+
+        def slow_urlopen(*args, **kwargs):
+            import time
+            time.sleep(0.005)
+            return FakeResponse(payload)
+
+        with patch("ingestion.deribit_history.urlopen", side_effect=slow_urlopen):
+            pages = fetch_trade_pages(plan)
+
+        # Due to max_seconds=0.001, only 1 page fetched before time budget expires
+        self.assertEqual(len(pages), 1)
 
 
 if __name__ == "__main__":

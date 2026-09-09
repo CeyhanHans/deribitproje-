@@ -1,0 +1,1220 @@
+diff --git a/storage/__init__.py b/storage/__init__.py
+new file mode 100644
+index 0000000..b052c5c
+--- /dev/null
++++ b/storage/__init__.py
+@@ -0,0 +1,39 @@
++"""Storage package for Deribit options backtest catalog.
++
++Provides:
++- SQLite transactional index.
++- Atomic Gzip JSONL raw archives.
++- Checksum verification & conflict protection.
++- Streaming TradeTick access with exact Decimal precision.
++- Store protocol compliance.
++"""
++
++from storage.archive import (
++    TradeArchiveReader,
++    TradeArchiveWriter,
++    validate_safe_path,
++)
++from storage.engine import TradeStorageEngine
++from storage.models import (
++    ArchiveManifest,
++    ArchiveStatus,
++    StorageChecksumError,
++    StorageConflictError,
++    StorageError,
++    StorageSecurityError,
++)
++from storage.sqlite_index import SQLiteCatalogIndex
++
++__all__ = [
++    "ArchiveManifest",
++    "ArchiveStatus",
++    "StorageError",
++    "StorageChecksumError",
++    "StorageConflictError",
++    "StorageSecurityError",
++    "TradeArchiveReader",
++    "TradeArchiveWriter",
++    "SQLiteCatalogIndex",
++    "TradeStorageEngine",
++    "validate_safe_path",
++]
+diff --git a/storage/archive.py b/storage/archive.py
+new file mode 100644
+index 0000000..cd80b80
+--- /dev/null
++++ b/storage/archive.py
+@@ -0,0 +1,192 @@
++"""Gzip-compressed JSONL raw archive manager with atomic writes and checksum verification.
++
++Ensures:
++- Decimal precision preservation without float conversion loss.
++- Atomic temp-file creation and rename (crash-safe).
++- Path traversal rejection.
++- Streaming generator reads with timestamp / instrument filters.
++"""
++
++from __future__ import annotations
++
++import gzip
++import hashlib
++import json
++import os
++import shutil
++import uuid
++from decimal import Decimal
++from pathlib import Path
++from typing import Any, Dict, Iterator, Optional, Sequence, Union
++
++from core.contracts import TradeTick
++from storage.models import (
++    StorageChecksumError,
++    StorageSecurityError,
++)
++
++
++def validate_safe_path(relpath: Union[str, Path], base_dir: Path) -> Path:
++    """Ensure relpath stays safely within base_dir, preventing path traversal attacks."""
++    base_resolved = base_dir.resolve()
++    relpath_str = str(relpath)
++    if ".." in relpath_str.split("/") or ".." in relpath_str.split("\\"):
++        raise StorageSecurityError(f"Path traversal detected: {relpath!r} contains '..'")
++    
++    target = (base_dir / relpath).resolve()
++    if not target.is_relative_to(base_resolved):
++        raise StorageSecurityError(f"Path traversal detected: {relpath!r} escapes base directory {base_dir}")
++    return target
++
++
++def trade_to_dict(trade: Union[dict, TradeTick]) -> Dict[str, Any]:
++    """Convert trade dict or TradeTick to JSON-serializable dictionary with string decimals."""
++    if isinstance(trade, TradeTick):
++        return {
++            "instrument_name": trade.instrument_name,
++            "trade_id": trade.trade_id,
++            "trade_seq": trade.trade_seq,
++            "timestamp": trade.timestamp_ms,
++            "price": str(trade.price_btc),
++            "amount": str(trade.quantity_contracts),
++            "source_ref": trade.source_ref,
++        }
++    
++    # Dict trade: ensure numeric values are properly preserved
++    d = dict(trade)
++    if "price" in d and isinstance(d["price"], (Decimal, float, int)):
++        d["price"] = str(d["price"])
++    if "amount" in d and isinstance(d["amount"], (Decimal, float, int)):
++        d["amount"] = str(d["amount"])
++    if "timestamp_ms" in d and "timestamp" not in d:
++        d["timestamp"] = d["timestamp_ms"]
++    return d
++
++
++def dict_to_trade_tick(d: Dict[str, Any]) -> TradeTick:
++    """Reconstruct immutable TradeTick with Decimal amounts from stored JSON dict."""
++    price_str = str(d.get("price", "0"))
++    amount_str = str(d.get("amount", d.get("quantity_contracts", "0")))
++    ts = int(d.get("timestamp", d.get("timestamp_ms", 0)))
++    seq = int(d.get("trade_seq", 0)) if d.get("trade_seq") is not None else 0
++    trade_id = str(d.get("trade_id", ""))
++    inst = str(d.get("instrument_name", ""))
++    source_ref = str(d.get("source_ref", f"archive_{trade_id}"))
++
++    return TradeTick(
++        instrument_name=inst,
++        trade_id=trade_id,
++        trade_seq=seq,
++        timestamp_ms=ts,
++        price_btc=Decimal(price_str),
++        quantity_contracts=Decimal(amount_str),
++        source_ref=source_ref,
++    )
++
++
++class TradeArchiveWriter:
++    """Writes trade streams to gzip-compressed JSONL with atomic temp-file rename."""
++
++    def __init__(self, archives_dir: Path) -> None:
++        self.archives_dir = archives_dir.resolve()
++        self.archives_dir.mkdir(parents=True, exist_ok=True)
++
++    def write_archive(
++        self,
++        instrument_name: str,
++        start_ms: int,
++        end_ms: int,
++        trades: Sequence[Union[dict, TradeTick]],
++    ) -> tuple[Path, str, str, int]:
++        """Write trades to .jsonl.gz atomically.
++
++        Returns:
++            (destination_path, raw_sha256, compressed_sha256, record_count)
++        """
++        temp_name = f"_tmp_{uuid.uuid4().hex}.jsonl.gz"
++        temp_path = self.archives_dir / temp_name
++
++        raw_hasher = hashlib.sha256()
++        record_count = 0
++
++        # 1. Write to temp file with fixed mtime for byte-for-byte deterministic hashing
++        with open(temp_path, "wb") as f_out:
++            with gzip.GzipFile(filename="", mode="wb", fileobj=f_out, compresslevel=6, mtime=0.0) as gz_out:
++                for t in trades:
++                    record = trade_to_dict(t)
++                    line_bytes = (json.dumps(record, separators=(",", ":"), ensure_ascii=False) + "\n").encode("utf-8")
++                    raw_hasher.update(line_bytes)
++                    gz_out.write(line_bytes)
++                    record_count += 1
++
++        # 2. Compute compressed sha256 of the temp file
++        compressed_hasher = hashlib.sha256()
++        with open(temp_path, "rb") as f:
++            while chunk := f.read(65536):
++                compressed_hasher.update(chunk)
++
++        raw_sha256 = raw_hasher.hexdigest()
++        compressed_sha256 = compressed_hasher.hexdigest()
++
++        # 3. Final atomic destination
++        safe_inst = instrument_name.replace("/", "_").replace("\\", "_")
++        dest_filename = f"{safe_inst}_{start_ms}_{end_ms}_{compressed_sha256[:12]}.jsonl.gz"
++        dest_path = self.archives_dir / dest_filename
++
++        # If dest already exists with same checksum, replace safely
++        if dest_path.exists():
++            temp_path.unlink()
++        else:
++            temp_path.replace(dest_path)
++
++        return dest_path, raw_sha256, compressed_sha256, record_count
++
++
++class TradeArchiveReader:
++    """Streams trade records from gzip-compressed JSONL files with checksum verification."""
++
++    @staticmethod
++    def verify_checksum(archive_path: Path, expected_sha256: str) -> None:
++        """Verify the SHA256 checksum of an archive file."""
++        if not archive_path.exists():
++            raise FileNotFoundError(f"Archive file not found: {archive_path}")
++        hasher = hashlib.sha256()
++        with open(archive_path, "rb") as f:
++            while chunk := f.read(65536):
++                hasher.update(chunk)
++        actual = hasher.hexdigest()
++        if actual != expected_sha256:
++            raise StorageChecksumError(
++                f"Checksum mismatch for {archive_path.name}: expected {expected_sha256}, got {actual}"
++            )
++
++    @classmethod
++    def stream_ticks(
++        cls,
++        archive_path: Path,
++        *,
++        expected_sha256: Optional[str] = None,
++        instrument_name: Optional[str] = None,
++        start_ms: Optional[int] = None,
++        end_ms: Optional[int] = None,
++    ) -> Iterator[TradeTick]:
++        """Stream TradeTick instances from .jsonl.gz with streaming filter."""
++        if expected_sha256 is not None:
++            cls.verify_checksum(archive_path, expected_sha256)
++
++        with gzip.open(archive_path, "rt", encoding="utf-8") as gz_in:
++            for line in gz_in:
++                if not line.strip():
++                    continue
++                record = json.loads(line)
++                ts = int(record.get("timestamp", record.get("timestamp_ms", 0)))
++                inst = str(record.get("instrument_name", ""))
++
++                if instrument_name is not None and inst != instrument_name:
++                    continue
++                if start_ms is not None and ts < start_ms:
++                    continue
++                if end_ms is not None and ts >= end_ms:
++                    continue
++
++                yield dict_to_trade_tick(record)
+diff --git a/storage/engine.py b/storage/engine.py
+new file mode 100644
+index 0000000..e2faec2
+--- /dev/null
++++ b/storage/engine.py
+@@ -0,0 +1,272 @@
++"""Integrated storage engine for Deribit trade archives, index, and cache.
++
++Conforms to core.contracts.Store protocol.
++Implements:
++- Atomic writes & rename.
++- SQLite indexing & transaction safety.
++- Path traversal prevention.
++- Checksum verification on read/import.
++- Decimal precision preservation for TradeTicks.
++- Export / import bundles for offline replay.
++- Incomplete manifest cache-hit exclusion.
++"""
++
++from __future__ import annotations
++
++import json
++import shutil
++import time
++import uuid
++from decimal import Decimal
++from pathlib import Path
++from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple, Union
++
++from core.contracts import Store, TradeTick
++from storage.archive import (
++    TradeArchiveReader,
++    TradeArchiveWriter,
++    validate_safe_path,
++)
++from storage.models import (
++    ArchiveManifest,
++    ArchiveStatus,
++    StorageChecksumError,
++    StorageConflictError,
++    StorageSecurityError,
++)
++from storage.sqlite_index import SQLiteCatalogIndex
++
++
++class TradeStorageEngine:
++    """Unified storage engine providing raw gzip archives, SQLite catalog, and Store protocol."""
++
++    def __init__(self, root_dir: Union[str, Path]) -> None:
++        self.root_dir = Path(root_dir).resolve()
++        self.root_dir.mkdir(parents=True, exist_ok=True)
++
++        self.archives_dir = self.root_dir / "archives"
++        self.archives_dir.mkdir(parents=True, exist_ok=True)
++
++        self.db_path = self.root_dir / "catalog_index.db"
++        self.index = SQLiteCatalogIndex(self.db_path)
++        self.writer = TradeArchiveWriter(self.archives_dir)
++        self.reader = TradeArchiveReader()
++
++    # --------------------------------------------------------------------------
++    # Store Protocol Implementation
++    # --------------------------------------------------------------------------
++
++    def put(self, key: str, value: bytes) -> None:
++        self.index.put_kv(key, value)
++
++    def get(self, key: str) -> Optional[bytes]:
++        return self.index.get_kv(key)
++
++    def query(self, prefix: str) -> Iterator[Tuple[str, bytes]]:
++        return self.index.query_kv(prefix)
++
++    def resume_state(self) -> Dict[str, Any]:
++        raw = self.get("resume_cursor")
++        if raw:
++            return json.loads(raw.decode("utf-8"))
++        return {}
++
++    # --------------------------------------------------------------------------
++    # Trade Archive Storage & Caching
++    # --------------------------------------------------------------------------
++
++    def store_trades(
++        self,
++        instrument_name: str,
++        start_ms: int,
++        end_ms: int,
++        trades: Sequence[Union[dict, TradeTick]],
++        *,
++        source_url: str = "",
++        source_params: Optional[Dict[str, Any]] = None,
++        status: str = ArchiveStatus.COMPLETE.value,
++        coverage_ratio: str = "1.0",
++        resume_cursor: Optional[Dict[str, Any]] = None,
++    ) -> ArchiveManifest:
++        """Atomically persist trades to a gzip-compressed JSONL archive and index it."""
++        dest_path, raw_sha, comp_sha, count = self.writer.write_archive(
++            instrument_name=instrument_name,
++            start_ms=start_ms,
++            end_ms=end_ms,
++            trades=trades,
++        )
++        relpath = dest_path.relative_to(self.root_dir).as_posix()
++        archive_id = f"arch_{instrument_name}_{start_ms}_{end_ms}_{comp_sha[:8]}"
++
++        manifest = ArchiveManifest(
++            archive_id=archive_id,
++            instrument_name=instrument_name,
++            start_ms=start_ms,
++            end_ms=end_ms,
++            source_url=source_url,
++            source_params=source_params or {},
++            capture_utc_ms=int(time.time() * 1000),
++            record_count=count,
++            sha256=comp_sha,
++            raw_sha256=raw_sha,
++            archive_relpath=relpath,
++            status=status,
++            coverage_ratio=coverage_ratio,
++            resume_cursor=resume_cursor,
++        )
++
++        self.index.register_archive(manifest)
++        return manifest
++
++    def find_cache_hit(
++        self, instrument_name: str, start_ms: int, end_ms: int
++    ) -> Optional[ArchiveManifest]:
++        """Check if an archive already exists that completely covers the requested window.
++
++        RULE: INCOMPLETE manifests NEVER qualify as a complete cache hit.
++        """
++        return self.index.find_complete_cache_hit(instrument_name, start_ms, end_ms)
++
++    def stream_trades(
++        self,
++        instrument_name: Optional[str] = None,
++        start_ms: Optional[int] = None,
++        end_ms: Optional[int] = None,
++    ) -> Iterator[TradeTick]:
++        """Stream TradeTicks matching criteria across stored archives without memory bloat."""
++        matching_archives = self.index.query_archives(instrument_name, start_ms, end_ms)
++        seen_trade_keys: set[tuple[int, str]] = set()
++
++        for arch in matching_archives:
++            archive_file = self.root_dir / arch.archive_relpath
++            if not archive_file.exists():
++                continue
++
++            for tick in self.reader.stream_ticks(
++                archive_file,
++                expected_sha256=arch.sha256,
++                instrument_name=instrument_name,
++                start_ms=start_ms,
++                end_ms=end_ms,
++            ):
++                key = (tick.trade_seq, tick.trade_id)
++                if key in seen_trade_keys:
++                    continue
++                seen_trade_keys.add(key)
++                yield tick
++
++    # --------------------------------------------------------------------------
++    # Import / Export Bundles for Offline Replay
++    # --------------------------------------------------------------------------
++
++    def export_bundle(
++        self,
++        target_dir: Union[str, Path],
++        *,
++        instrument_name: Optional[str] = None,
++        start_ms: Optional[int] = None,
++        end_ms: Optional[int] = None,
++    ) -> Path:
++        """Export matching archives and manifest to a target directory for offline replay."""
++        out_dir = Path(target_dir).resolve()
++        out_dir.mkdir(parents=True, exist_ok=True)
++        out_archives_dir = out_dir / "archives"
++        out_archives_dir.mkdir(parents=True, exist_ok=True)
++
++        archives = self.index.query_archives(instrument_name, start_ms, end_ms)
++        manifests_data = []
++
++        for arch in archives:
++            src_file = validate_safe_path(arch.archive_relpath, self.root_dir)
++            if not src_file.exists():
++                continue
++
++            # Verify checksum before exporting
++            self.reader.verify_checksum(src_file, arch.sha256)
++
++            dest_filename = Path(arch.archive_relpath).name
++            dest_file = validate_safe_path(dest_filename, out_archives_dir)
++            shutil.copy2(src_file, dest_file)
++
++            d = arch.to_dict()
++            d["archive_relpath"] = f"archives/{dest_filename}"
++            manifests_data.append(d)
++
++        manifest_file = out_dir / "manifest.json"
++        manifest_payload = {
++            "exported_at_utc_ms": int(time.time() * 1000),
++            "archive_count": len(manifests_data),
++            "archives": manifests_data,
++        }
++        manifest_file.write_text(json.dumps(manifest_payload, indent=2), encoding="utf-8")
++        return manifest_file
++
++    def import_bundle(self, source_dir: Union[str, Path]) -> list[ArchiveManifest]:
++        """Import archives from an offline bundle with security and checksum checks.
++
++        Enforces:
++        - Path traversal rejection.
++        - Checksum verification of every imported archive.
++        - Hash conflict rejection if destination exists with different checksum.
++        """
++        src_dir = Path(source_dir).resolve()
++        manifest_file = src_dir / "manifest.json"
++        if not manifest_file.exists():
++            raise FileNotFoundError(f"Bundle manifest.json not found in {src_dir}")
++
++        payload = json.loads(manifest_file.read_text(encoding="utf-8"))
++        archive_dicts = payload.get("archives", [])
++        imported: list[ArchiveManifest] = []
++
++        for d in archive_dicts:
++            manifest = ArchiveManifest.from_dict(d)
++
++            # Security: validate safe path
++            src_archive = validate_safe_path(manifest.archive_relpath, src_dir)
++            if not src_archive.exists():
++                raise FileNotFoundError(f"Archive file {src_archive} referenced in bundle does not exist")
++
++            # Checksum verification
++            self.reader.verify_checksum(src_archive, manifest.sha256)
++
++            dest_filename = Path(manifest.archive_relpath).name
++            dest_archive = validate_safe_path(dest_filename, self.archives_dir)
++
++            if dest_archive.exists():
++                # Check for hash conflict
++                hasher = hashlib.sha256()
++                with open(dest_archive, "rb") as f:
++                    while chunk := f.read(65536):
++                        hasher.update(chunk)
++                existing_sha = hasher.hexdigest()
++                if existing_sha != manifest.sha256:
++                    raise StorageConflictError(
++                        f"Existing file {dest_archive.name} has conflicting SHA256 ({existing_sha}) "
++                        f"versus incoming archive ({manifest.sha256})"
++                    )
++            else:
++                shutil.copy2(src_archive, dest_archive)
++
++            # Register in SQLite catalog
++            new_relpath = dest_archive.relative_to(self.root_dir).as_posix()
++            updated_manifest = ArchiveManifest(
++                archive_id=manifest.archive_id,
++                instrument_name=manifest.instrument_name,
++                start_ms=manifest.start_ms,
++                end_ms=manifest.end_ms,
++                source_url=manifest.source_url,
++                source_params=manifest.source_params,
++                capture_utc_ms=manifest.capture_utc_ms,
++                record_count=manifest.record_count,
++                sha256=manifest.sha256,
++                raw_sha256=manifest.raw_sha256,
++                archive_relpath=new_relpath,
++                schema_version=manifest.schema_version,
++                status=manifest.status,
++                coverage_ratio=manifest.coverage_ratio,
++                resume_cursor=manifest.resume_cursor,
++            )
++            self.index.register_archive(updated_manifest)
++            imported.append(updated_manifest)
++
++        return imported
+diff --git a/storage/models.py b/storage/models.py
+new file mode 100644
+index 0000000..e1c87e6
+--- /dev/null
++++ b/storage/models.py
+@@ -0,0 +1,100 @@
++"""Storage models, manifest specifications, and exceptions for Deribit option backtest catalog.
++
++Schema Version: 1.0
++Conforms to immutable core contracts specification.
++"""
++
++from __future__ import annotations
++
++import json
++from dataclasses import asdict, dataclass, field
++from decimal import Decimal
++from enum import Enum
++from pathlib import Path
++from typing import Any, Dict, Optional
++
++SCHEMA_VERSION: str = "1.0"
++
++
++class StorageError(Exception):
++    """Base exception for storage errors."""
++
++
++class StorageChecksumError(StorageError):
++    """Raised when stored or imported data fails SHA256 checksum verification."""
++
++
++class StorageConflictError(StorageError):
++    """Raised when an operation attempts to overwrite data with conflicting content."""
++
++
++class StorageSecurityError(StorageError):
++    """Raised when path traversal or unauthorized directory escape is detected."""
++
++
++class ArchiveStatus(str, Enum):
++    COMPLETE = "COMPLETE"
++    INCOMPLETE = "INCOMPLETE"
++    EMPTY = "EMPTY"
++
++
++@dataclass(frozen=True)
++class ArchiveManifest:
++    """Immutable manifest for a stored trade archive."""
++    archive_id: str
++    instrument_name: str
++    start_ms: int
++    end_ms: int
++    source_url: str
++    source_params: Dict[str, Any]
++    capture_utc_ms: int
++    record_count: int
++    sha256: str
++    raw_sha256: str
++    archive_relpath: str
++    schema_version: str = SCHEMA_VERSION
++    status: str = ArchiveStatus.COMPLETE.value
++    coverage_ratio: str = "1.0"
++    resume_cursor: Optional[Dict[str, Any]] = None
++
++    def __post_init__(self) -> None:
++        if not self.archive_id:
++            raise ValueError("archive_id cannot be empty")
++        if not self.instrument_name:
++            raise ValueError("instrument_name cannot be empty")
++        if self.start_ms < 0 or self.end_ms < 0:
++            raise ValueError("start_ms and end_ms must be non-negative")
++        if self.start_ms > self.end_ms:
++            raise ValueError(f"start_ms ({self.start_ms}) cannot exceed end_ms ({self.end_ms})")
++        if not self.sha256 or len(self.sha256) != 64:
++            raise ValueError("sha256 must be a 64-character hex string")
++        if not self.raw_sha256 or len(self.raw_sha256) != 64:
++            raise ValueError("raw_sha256 must be a 64-character hex string")
++        if self.status not in [e.value for e in ArchiveStatus]:
++            raise ValueError(f"Invalid status: {self.status}")
++
++    def is_complete(self) -> bool:
++        return self.status == ArchiveStatus.COMPLETE.value
++
++    def to_dict(self) -> Dict[str, Any]:
++        return asdict(self)
++
++    @classmethod
++    def from_dict(cls, d: Dict[str, Any]) -> ArchiveManifest:
++        return cls(
++            archive_id=str(d["archive_id"]),
++            instrument_name=str(d["instrument_name"]),
++            start_ms=int(d["start_ms"]),
++            end_ms=int(d["end_ms"]),
++            source_url=str(d.get("source_url", "")),
++            source_params=dict(d.get("source_params", {})),
++            capture_utc_ms=int(d["capture_utc_ms"]),
++            record_count=int(d["record_count"]),
++            sha256=str(d["sha256"]),
++            raw_sha256=str(d["raw_sha256"]),
++            archive_relpath=str(d["archive_relpath"]),
++            schema_version=str(d.get("schema_version", SCHEMA_VERSION)),
++            status=str(d.get("status", ArchiveStatus.COMPLETE.value)),
++            coverage_ratio=str(d.get("coverage_ratio", "1.0")),
++            resume_cursor=d.get("resume_cursor"),
++        )
+diff --git a/storage/sqlite_index.py b/storage/sqlite_index.py
+new file mode 100644
+index 0000000..17fb0d1
+--- /dev/null
++++ b/storage/sqlite_index.py
+@@ -0,0 +1,277 @@
++"""SQLite transactional catalog index for historical archives and key-value state.
++
++Features:
++- WAL mode for concurrent readers and writer safety.
++- Transactional ACID integrity with automatic connection closing on Windows.
++- Hash conflict detection (rejects overwriting data with conflicting checksum).
++- Strict cache hit rule: incomplete manifests never return complete cache hits.
++"""
++
++from __future__ import annotations
++
++import json
++import sqlite3
++import time
++from contextlib import contextmanager
++from pathlib import Path
++from typing import Any, Dict, Iterator, Optional, Sequence, Tuple
++
++from storage.models import (
++    ArchiveManifest,
++    ArchiveStatus,
++    StorageConflictError,
++)
++
++
++class SQLiteCatalogIndex:
++    """SQLite-backed metadata catalog and KV store for historical archives."""
++
++    def __init__(self, db_path: Path) -> None:
++        self.db_path = db_path.resolve()
++        self.db_path.parent.mkdir(parents=True, exist_ok=True)
++        self._init_db()
++
++    @contextmanager
++    def _connection(self) -> Iterator[sqlite3.Connection]:
++        conn = sqlite3.connect(str(self.db_path), timeout=10.0)
++        conn.row_factory = sqlite3.Row
++        conn.execute("PRAGMA journal_mode = WAL;")
++        conn.execute("PRAGMA busy_timeout = 5000;")
++        conn.execute("PRAGMA foreign_keys = ON;")
++        try:
++            yield conn
++            conn.commit()
++        except Exception:
++            conn.rollback()
++            raise
++        finally:
++            conn.close()
++
++    def _init_db(self) -> None:
++        with self._connection() as conn:
++            conn.executescript(
++                """
++                CREATE TABLE IF NOT EXISTS archives (
++                    archive_id TEXT PRIMARY KEY,
++                    instrument_name TEXT NOT NULL,
++                    start_ms INTEGER NOT NULL,
++                    end_ms INTEGER NOT NULL,
++                    source_url TEXT,
++                    source_params TEXT,
++                    capture_utc_ms INTEGER NOT NULL,
++                    schema_version TEXT NOT NULL,
++                    record_count INTEGER NOT NULL,
++                    sha256 TEXT NOT NULL,
++                    raw_sha256 TEXT NOT NULL,
++                    status TEXT NOT NULL,
++                    coverage_ratio TEXT NOT NULL,
++                    archive_relpath TEXT NOT NULL,
++                    resume_cursor TEXT,
++                    created_at_ms INTEGER NOT NULL
++                );
++
++                CREATE INDEX IF NOT EXISTS idx_archives_inst_time
++                ON archives (instrument_name, start_ms, end_ms);
++
++                CREATE INDEX IF NOT EXISTS idx_archives_sha256
++                ON archives (sha256);
++
++                CREATE TABLE IF NOT EXISTS kv_store (
++                    key TEXT PRIMARY KEY,
++                    value BLOB NOT NULL,
++                    updated_at_ms INTEGER NOT NULL
++                );
++                """
++            )
++
++    def register_archive(self, manifest: ArchiveManifest) -> None:
++        """Register an archive manifest, enforcing hash consistency."""
++        now_ms = int(time.time() * 1000)
++        with self._connection() as conn:
++            # Check for existing entry with same instrument and time range
++            cur = conn.execute(
++                """
++                SELECT archive_id, sha256, status
++                FROM archives
++                WHERE instrument_name = ? AND start_ms = ? AND end_ms = ?
++                """,
++                (manifest.instrument_name, manifest.start_ms, manifest.end_ms),
++            )
++            existing = cur.fetchone()
++            if existing:
++                is_completion_upgrade = (
++                    existing["status"] == ArchiveStatus.INCOMPLETE.value
++                    and manifest.status == ArchiveStatus.COMPLETE.value
++                )
++                if existing["sha256"] != manifest.sha256 and not is_completion_upgrade:
++                    raise StorageConflictError(
++                        f"Conflict: archive for {manifest.instrument_name} [{manifest.start_ms}, {manifest.end_ms}) "
++                        f"already exists with different SHA256 (existing {existing['sha256'][:12]}, incoming {manifest.sha256[:12]})"
++                    )
++                # Update archive metadata
++                conn.execute(
++                    """
++                    UPDATE archives
++                    SET capture_utc_ms = MAX(capture_utc_ms, ?),
++                        status = ?,
++                        sha256 = ?,
++                        raw_sha256 = ?,
++                        record_count = ?,
++                        resume_cursor = ?,
++                        archive_relpath = ?
++                    WHERE archive_id = ?
++                    """,
++                    (
++                        manifest.capture_utc_ms,
++                        manifest.status,
++                        manifest.sha256,
++                        manifest.raw_sha256,
++                        manifest.record_count,
++                        json.dumps(manifest.resume_cursor) if manifest.resume_cursor else None,
++                        manifest.archive_relpath,
++                        existing["archive_id"],
++                    ),
++                )
++                return
++
++            # Insert new archive
++            conn.execute(
++                """
++                INSERT INTO archives (
++                    archive_id, instrument_name, start_ms, end_ms,
++                    source_url, source_params, capture_utc_ms, schema_version,
++                    record_count, sha256, raw_sha256, status,
++                    coverage_ratio, archive_relpath, resume_cursor, created_at_ms
++                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
++                """,
++                (
++                    manifest.archive_id,
++                    manifest.instrument_name,
++                    manifest.start_ms,
++                    manifest.end_ms,
++                    manifest.source_url,
++                    json.dumps(manifest.source_params),
++                    manifest.capture_utc_ms,
++                    manifest.schema_version,
++                    manifest.record_count,
++                    manifest.sha256,
++                    manifest.raw_sha256,
++                    manifest.status,
++                    manifest.coverage_ratio,
++                    manifest.archive_relpath,
++                    json.dumps(manifest.resume_cursor) if manifest.resume_cursor else None,
++                    now_ms,
++                ),
++            )
++
++    def find_complete_cache_hit(
++        self, instrument_name: str, start_ms: int, end_ms: int
++    ) -> Optional[ArchiveManifest]:
++        """Find an existing archive that completely covers the requested window.
++
++        CRITICAL RULE:
++        Manifests marked as INCOMPLETE will NEVER be returned as a complete cache hit.
++        """
++        with self._connection() as conn:
++            cur = conn.execute(
++                """
++                SELECT * FROM archives
++                WHERE instrument_name = ?
++                  AND start_ms <= ?
++                  AND end_ms >= ?
++                  AND status = ?
++                ORDER BY (end_ms - start_ms) DESC, created_at_ms DESC
++                LIMIT 1
++                """,
++                (instrument_name, start_ms, end_ms, ArchiveStatus.COMPLETE.value),
++            )
++            row = cur.fetchone()
++            if not row:
++                return None
++            return self._row_to_manifest(row)
++
++    def query_archives(
++        self,
++        instrument_name: Optional[str] = None,
++        start_ms: Optional[int] = None,
++        end_ms: Optional[int] = None,
++    ) -> list[ArchiveManifest]:
++        """Query archives matching criteria."""
++        query = "SELECT * FROM archives WHERE 1=1"
++        params: list[Any] = []
++
++        if instrument_name is not None:
++            query += " AND instrument_name = ?"
++            params.append(instrument_name)
++        if start_ms is not None:
++            query += " AND end_ms > ?"
++            params.append(start_ms)
++        if end_ms is not None:
++            query += " AND start_ms < ?"
++            params.append(end_ms)
++
++        query += " ORDER BY start_ms ASC, end_ms ASC"
++
++        with self._connection() as conn:
++            cur = conn.execute(query, params)
++            return [self._row_to_manifest(row) for row in cur.fetchall()]
++
++    def get_manifest_by_id(self, archive_id: str) -> Optional[ArchiveManifest]:
++        with self._connection() as conn:
++            cur = conn.execute("SELECT * FROM archives WHERE archive_id = ?", (archive_id,))
++            row = cur.fetchone()
++            if not row:
++                return None
++            return self._row_to_manifest(row)
++
++    def put_kv(self, key: str, value: bytes) -> None:
++        now_ms = int(time.time() * 1000)
++        with self._connection() as conn:
++            conn.execute(
++                """
++                INSERT INTO kv_store (key, value, updated_at_ms)
++                VALUES (?, ?, ?)
++                ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at_ms = excluded.updated_at_ms
++                """,
++                (key, value, now_ms),
++            )
++
++    def get_kv(self, key: str) -> Optional[bytes]:
++        with self._connection() as conn:
++            cur = conn.execute("SELECT value FROM kv_store WHERE key = ?", (key,))
++            row = cur.fetchone()
++            if not row:
++                return None
++            return bytes(row["value"])
++
++    def query_kv(self, prefix: str) -> Iterator[Tuple[str, bytes]]:
++        with self._connection() as conn:
++            cur = conn.execute(
++                "SELECT key, value FROM kv_store WHERE key LIKE ? ORDER BY key ASC",
++                (f"{prefix}%",),
++            )
++            rows = cur.fetchall()
++        for row in rows:
++            yield (str(row["key"]), bytes(row["value"]))
++
++    @staticmethod
++    def _row_to_manifest(row: sqlite3.Row) -> ArchiveManifest:
++        cursor_data = json.loads(row["resume_cursor"]) if row["resume_cursor"] else None
++        source_params = json.loads(row["source_params"]) if row["source_params"] else {}
++        return ArchiveManifest(
++            archive_id=row["archive_id"],
++            instrument_name=row["instrument_name"],
++            start_ms=row["start_ms"],
++            end_ms=row["end_ms"],
++            source_url=row["source_url"] or "",
++            source_params=source_params,
++            capture_utc_ms=row["capture_utc_ms"],
++            schema_version=row["schema_version"],
++            record_count=row["record_count"],
++            sha256=row["sha256"],
++            raw_sha256=row["raw_sha256"],
++            status=row["status"],
++            coverage_ratio=row["coverage_ratio"],
++            archive_relpath=row["archive_relpath"],
++            resume_cursor=cursor_data,
++        )
+diff --git a/tests/test_storage_v1.py b/tests/test_storage_v1.py
+new file mode 100644
+index 0000000..adf604c
+--- /dev/null
++++ b/tests/test_storage_v1.py
+@@ -0,0 +1,304 @@
++"""Acceptance and unit tests for Task 5: Storage engine, index, cache, and manifests.
++
++Covers:
++- Kesintili yazÄ±m (interrupted write / temp file cleanup)
++- Bozuk hash (tampered archive detected by checksum verification)
++- AynÄ± dosya tekrar import (idempotent re-import)
++- Conflicting content (hash collision / conflict detection)
++- EÅŸzamanlÄ± okuyucu (concurrent multithreaded readers)
++- Path traversal rejection
++- Streaming bÃ¼yÃ¼k fixture (large fixture streaming with generator)
++- Kaynak fiyatlarÄ± deÄŸiÅŸmeden roundtrip (exact Decimal precision preservation)
++- Manifest incomplete iken complete cache hit verme
++- Store protocol compliance (put, get, query, resume_state)
++- Export / import bundle roundtrip for offline replay
++"""
++
++import concurrent.futures
++import gzip
++import json
++import tempfile
++import unittest
++from decimal import Decimal
++from pathlib import Path
++
++from core.contracts import Store, TradeTick
++from storage import (
++    ArchiveManifest,
++    ArchiveStatus,
++    SQLiteCatalogIndex,
++    StorageChecksumError,
++    StorageConflictError,
++    StorageSecurityError,
++    TradeArchiveReader,
++    TradeArchiveWriter,
++    TradeStorageEngine,
++    validate_safe_path,
++)
++
++
++class StorageV1Tests(unittest.TestCase):
++    def setUp(self):
++        self.temp_dir = tempfile.TemporaryDirectory()
++        self.root_path = Path(self.temp_dir.name)
++        self.engine = TradeStorageEngine(self.root_path)
++
++    def tearDown(self):
++        self.temp_dir.cleanup()
++
++    # --------------------------------------------------------------------------
++    # 1. Kaynak FiyatlarÄ± DeÄŸiÅŸmeden Roundtrip (Decimal Precision)
++    # --------------------------------------------------------------------------
++
++    def test_price_and_quantity_exact_decimal_roundtrip(self):
++        """Verify TradeTick price and quantity retain exact Decimal precision through storage."""
++        inst = "BTC-27DEC24-100000-C"
++        precise_price = Decimal("0.000012345678")
++        precise_qty = Decimal("12345.67890123")
++
++        ticks = [
++            TradeTick(
++                instrument_name=inst,
++                trade_id="T_DEC_01",
++                trade_seq=1,
++                timestamp_ms=1700000000000,
++                price_btc=precise_price,
++                quantity_contracts=precise_qty,
++            )
++        ]
++
++        manifest = self.engine.store_trades(
++            instrument_name=inst,
++            start_ms=1700000000000,
++            end_ms=1700000001000,
++            trades=ticks,
++        )
++        self.assertEqual(manifest.record_count, 1)
++
++        loaded_ticks = list(self.engine.stream_trades(instrument_name=inst))
++        self.assertEqual(len(loaded_ticks), 1)
++        self.assertEqual(loaded_ticks[0].price_btc, precise_price)
++        self.assertEqual(loaded_ticks[0].quantity_contracts, precise_qty)
++        self.assertIsInstance(loaded_ticks[0].price_btc, Decimal)
++        self.assertIsInstance(loaded_ticks[0].quantity_contracts, Decimal)
++
++    # --------------------------------------------------------------------------
++    # 2. Manifest Incomplete Ä°ken Complete Cache Hit Verme
++    # --------------------------------------------------------------------------
++
++    def test_incomplete_manifest_never_returns_complete_cache_hit(self):
++        """CRITICAL: Incomplete manifest must NEVER be returned as a complete cache hit."""
++        inst = "BTC-27DEC24-90000-P"
++        trades = [
++            {"instrument_name": inst, "trade_id": "T1", "trade_seq": 1, "timestamp": 1000, "price": 0.05, "amount": 1}
++        ]
++
++        # 1. Store as INCOMPLETE
++        self.engine.store_trades(
++            instrument_name=inst,
++            start_ms=1000,
++            end_ms=5000,
++            trades=trades,
++            status=ArchiveStatus.INCOMPLETE.value,
++        )
++
++        # Cache check must return None
++        cache_hit = self.engine.find_cache_hit(inst, 1000, 5000)
++        self.assertIsNone(cache_hit, "Incomplete archive must not produce a complete cache hit")
++
++        # 2. Re-store as COMPLETE (e.g. full download finished)
++        complete_trades = [
++            {"instrument_name": inst, "trade_id": "T1", "trade_seq": 1, "timestamp": 1000, "price": 0.05, "amount": 1},
++            {"instrument_name": inst, "trade_id": "T2", "trade_seq": 2, "timestamp": 4000, "price": 0.06, "amount": 2},
++        ]
++        self.engine.store_trades(
++            instrument_name=inst,
++            start_ms=1000,
++            end_ms=5000,
++            trades=complete_trades,
++            status=ArchiveStatus.COMPLETE.value,
++        )
++
++        # Cache check now succeeds!
++        cache_hit_2 = self.engine.find_cache_hit(inst, 1000, 5000)
++        self.assertIsNotNone(cache_hit_2)
++        self.assertEqual(cache_hit_2.status, ArchiveStatus.COMPLETE.value)
++        self.assertEqual(cache_hit_2.record_count, 2)
++
++    # --------------------------------------------------------------------------
++    # 3. Bozuk Hash (Tampered Checksum Detection)
++    # --------------------------------------------------------------------------
++
++    def test_tampered_archive_raises_storage_checksum_error(self):
++        """Tampering with an archive file is detected by checksum verification."""
++        inst = "BTC-TEST"
++        trades = [{"instrument_name": inst, "trade_id": "T1", "trade_seq": 1, "timestamp": 1000, "price": 0.05, "amount": 1}]
++        manifest = self.engine.store_trades(inst, 1000, 2000, trades)
++
++        # Corrupt the file on disk
++        archive_file = self.root_path / manifest.archive_relpath
++        data = bytearray(archive_file.read_bytes())
++        data[-1] ^= 0xFF  # flip bits in the last byte
++        archive_file.write_bytes(data)
++
++        # Streaming should detect checksum mismatch and raise StorageChecksumError
++        with self.assertRaises(StorageChecksumError):
++            list(self.engine.stream_trades(inst))
++
++    # --------------------------------------------------------------------------
++    # 4. Kesintili YazÄ±m (Interrupted Write)
++    # --------------------------------------------------------------------------
++
++    def test_interrupted_write_leaves_no_corrupt_index_entry(self):
++        """Simulate an interrupted write leaving a temp file; index remains uncorrupted."""
++        temp_file = self.engine.archives_dir / "_tmp_orphan_crash.jsonl.gz"
++        temp_file.write_bytes(b"partial corrupted gzip bytes")
++
++        # Ensure index still queries cleanly
++        archives = self.engine.index.query_archives()
++        self.assertEqual(len(archives), 0)
++
++        # Storing new trades succeeds normally without interference
++        inst = "BTC-TEST"
++        self.engine.store_trades(inst, 1000, 2000, [{"instrument_name": inst, "trade_seq": 1, "timestamp": 1000}])
++        self.assertEqual(len(self.engine.index.query_archives()), 1)
++
++    # --------------------------------------------------------------------------
++    # 5. AynÄ± Dosya Tekrar Import & Conflicting Content
++    # --------------------------------------------------------------------------
++
++    def test_idempotent_re_store_and_conflicting_content_rejection(self):
++        """Identical re-store succeeds; conflicting content for same range raises StorageConflictError."""
++        inst = "BTC-27DEC24-100000-C"
++        trades_1 = [{"instrument_name": inst, "trade_id": "T1", "trade_seq": 1, "timestamp": 1000, "price": 0.05, "amount": 1}]
++        trades_conflict = [{"instrument_name": inst, "trade_id": "T2", "trade_seq": 2, "timestamp": 1000, "price": 0.99, "amount": 5}]
++
++        # 1. First store
++        m1 = self.engine.store_trades(inst, 1000, 2000, trades_1)
++
++        # 2. Idempotent re-store with same trades
++        m2 = self.engine.store_trades(inst, 1000, 2000, trades_1)
++        self.assertEqual(m1.sha256, m2.sha256)
++
++        # 3. Conflicting store for same instrument & time range
++        with self.assertRaisesRegex(StorageConflictError, "Conflict: archive"):
++            self.engine.store_trades(inst, 1000, 2000, trades_conflict)
++
++    # --------------------------------------------------------------------------
++    # 6. EÅŸzamanlÄ± Okuyucu (Concurrent Readers)
++    # --------------------------------------------------------------------------
++
++    def test_concurrent_multithreaded_readers(self):
++        """Multiple concurrent threads stream trades without deadlock or error."""
++        inst = "BTC-CONCURRENT"
++        trades = [
++            {"instrument_name": inst, "trade_id": f"T{i}", "trade_seq": i, "timestamp": 1000 + i * 10, "price": 0.05, "amount": 1.0}
++            for i in range(100)
++        ]
++        self.engine.store_trades(inst, 1000, 3000, trades)
++
++        def reader_task():
++            ticks = list(self.engine.stream_trades(inst))
++            return len(ticks)
++
++        with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
++            futures = [executor.submit(reader_task) for _ in range(10)]
++            results = [f.result() for f in concurrent.futures.as_completed(futures)]
++
++        self.assertEqual(len(results), 10)
++        self.assertTrue(all(r == 100 for r in results))
++
++    # --------------------------------------------------------------------------
++    # 7. Path Traversal KorumasÄ±
++    # --------------------------------------------------------------------------
++
++    def test_path_traversal_attempts_are_rejected(self):
++        """Attempts to access paths with '..' or escape the root directory raise StorageSecurityError."""
++        with self.assertRaises(StorageSecurityError):
++            validate_safe_path("../../etc/passwd", self.root_path)
++
++        with self.assertRaises(StorageSecurityError):
++            validate_safe_path("archives/../../../secret.txt", self.root_path)
++
++    # --------------------------------------------------------------------------
++    # 8. Streaming BÃ¼yÃ¼k Fixture (Generator Efficiency)
++    # --------------------------------------------------------------------------
++
++    def test_large_fixture_streaming_and_window_filtering(self):
++        """Stream 5,000 trades efficiently with timestamp filtering."""
++        inst = "BTC-BIG-FIXTURE"
++        trades = [
++            {"instrument_name": inst, "trade_id": f"T_{i}", "trade_seq": i, "timestamp": 1000 + i, "price": 0.05, "amount": 1.0}
++            for i in range(5000)
++        ]
++        self.engine.store_trades(inst, 1000, 6000, trades)
++
++        # Stream subset [2000, 3000)
++        subset_generator = self.engine.stream_trades(inst, start_ms=2000, end_ms=3000)
++        subset = list(subset_generator)
++
++        self.assertEqual(len(subset), 1000)
++        self.assertEqual(subset[0].timestamp_ms, 2000)
++        self.assertEqual(subset[-1].timestamp_ms, 2999)
++
++    # --------------------------------------------------------------------------
++    # 9. Store Protocol Implementation
++    # --------------------------------------------------------------------------
++
++    def test_store_protocol_put_get_query_resume_state(self):
++        """Verify TradeStorageEngine fully satisfies the Store protocol."""
++        self.assertIsInstance(self.engine, Store)
++
++        # put and get
++        self.engine.put("cursor_1", b"state_bytes_123")
++        self.assertEqual(self.engine.get("cursor_1"), b"state_bytes_123")
++        self.assertIsNone(self.engine.get("non_existent"))
++
++        # query
++        self.engine.put("state/a", b"1")
++        self.engine.put("state/b", b"2")
++        self.engine.put("other/c", b"3")
++        queried = list(self.engine.query("state/"))
++        self.assertEqual(len(queried), 2)
++        self.assertEqual(queried[0][0], "state/a")
++
++        # resume_state
++        self.engine.put("resume_cursor", json.dumps({"page": 5, "last_seq": 500}).encode("utf-8"))
++        resumed = self.engine.resume_state()
++        self.assertEqual(resumed, {"page": 5, "last_seq": 500})
++
++    # --------------------------------------------------------------------------
++    # 10. Export / Import Bundle Roundtrip
++    # --------------------------------------------------------------------------
++
++    def test_export_and_import_bundle_offline_replay(self):
++        """Export archives to offline bundle and import into a fresh engine instance."""
++        inst = "BTC-OFFLINE"
++        trades = [
++            {"instrument_name": inst, "trade_id": "T1", "trade_seq": 1, "timestamp": 1000, "price": 0.05, "amount": 1.0},
++            {"instrument_name": inst, "trade_id": "T2", "trade_seq": 2, "timestamp": 2000, "price": 0.06, "amount": 2.0},
++        ]
++        orig_manifest = self.engine.store_trades(inst, 1000, 3000, trades)
++
++        with tempfile.TemporaryDirectory() as export_dir:
++            bundle_manifest = self.engine.export_bundle(export_dir)
++            self.assertTrue(Path(bundle_manifest).exists())
++
++            # Create fresh second engine
++            with tempfile.TemporaryDirectory() as second_root:
++                engine2 = TradeStorageEngine(second_root)
++                imported_manifests = engine2.import_bundle(export_dir)
++
++                self.assertEqual(len(imported_manifests), 1)
++                self.assertEqual(imported_manifests[0].sha256, orig_manifest.sha256)
++                self.assertEqual(imported_manifests[0].record_count, 2)
++
++                # Verify streaming from second engine produces identical TradeTicks
++                ticks = list(engine2.stream_trades(inst))
++                self.assertEqual(len(ticks), 2)
++                self.assertEqual(ticks[0].price_btc, Decimal("0.05"))
++                self.assertEqual(ticks[1].price_btc, Decimal("0.06"))
++
++
++if __name__ == "__main__":
++    unittest.main()

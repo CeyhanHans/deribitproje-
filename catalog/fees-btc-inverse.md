@@ -183,5 +183,29 @@ Backtestte varsayılan olarak:
 1. Normal trade fee için account tier yoksa `Standard` kullan, fakat sonucu `standard_fee_estimate` olarak işaretle.
 2. Maker/taker role fill seviyesinde saklanmalı; limit order maker varsayılmamalı.
 3. BTC inverse option premium, fee ve settlement cashflow'ları BTC cinsinden izlenmeli; USD yalnız strike/index/delivery price ve raporlama karşılığı için kullanılmalı.
-4. Daily options için delivery fee `0` olmalı.
-5. Daily olmayan expiry delivery için fee parametreleri saklanmalı, fakat exact fee reconciliation yapılmadan kesin delivery fee debit'i tahmin edilmemeli.
+4. Daily options için delivery fee strictly `0.0` (`0%`) olmalı.
+5. Daily olmayan expiry delivery için fee parametresi `0.015%` (`0.00015 BTC`) uygulanır ve `%12.5` delivery cap ile sınırlandırılır.
+6. **Tarihsel Ücret Doğrulama Kuralı (`configured_unverified` vs `confirmed`)**:
+   - Güncel resmi kurallar Deribit Support Fees sayfasından 2026-08-17 tarihi itibarıyla doğrulanmıştır (`confirmed`).
+   - 2026-08-17 öncesi tarihsel dönemler için birincil kanıt bulunmuyorsa, bugünkü ücretler geçmişe `confirmed` olarak taşınamaz.
+   - Bu dönemler için `verification_status: configured_unverified` atanmalıdır.
+7. **Delivery Fiyatı İkame Yasağı**:
+   - Expiry anında resmi delivery price eksikse, perpetual close veya başka bir proxy ile ikame yapılamaz (`MissingDeliveryPriceError`).
+   - Settlement, enstrüman kotasyonu veya işlem olmasa dahi resmi delivery fiyatı ile hesaplanır.
+
+## FeeSchedule Veri Yapısı ve Zaman Çizelgesi
+
+```yaml
+FeeSchedule:
+  schedule_id: string
+  effective_start_ms: integer (UTC milliseconds)
+  effective_end_ms: integer or null (UTC milliseconds)
+  trading_fee_rate: Decimal (default: 0.0003 BTC / contract)
+  trading_fee_cap_ratio: Decimal (default: 0.125 = 12.5% of premium)
+  delivery_fee_rate_standard: Decimal (default: 0.00015 BTC / contract)
+  delivery_fee_rate_daily: Decimal (0.0 BTC)
+  delivery_fee_cap_ratio: Decimal (default: 0.125 = 12.5% of delivery value)
+  verification_status: "confirmed" | "configured_unverified"
+  source_reference: string
+```
+

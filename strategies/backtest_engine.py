@@ -1,3 +1,14 @@
+"""Legacy single-position USD cashflow backtest engine.
+
+DISCLAIMER & ARCHITECTURAL STATUS:
+This module is a historical single-position prototype evaluating legacy USD cashflow
+for multi-leg option strategies. It does NOT implement a continuous multi-trade
+event loop, advanced signal evaluation, or the authoritative BTC balance ledger
+defined in core.contracts (Task 1). It is maintained for baseline compatibility
+and single-trade unit verification.
+"""
+
+import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Mapping, Sequence
@@ -6,7 +17,7 @@ from strategies.strategy_schema import ExitType, Side, StrategyDefinition, valid
 
 
 class BacktestEngineError(ValueError):
-    """Raised when market data cannot support a strategy run."""
+    """Raised when market data or strategy parameters cannot support a backtest run."""
 
 
 @dataclass(frozen=True)
@@ -19,6 +30,7 @@ class MarketObservation:
     btc_usd: float
     expiry_utc: datetime | None = None
     data_quality_label: str = "official-historical"
+    is_settlement: bool = False
 
 
 @dataclass(frozen=True)
@@ -51,6 +63,7 @@ class BacktestResult:
     trades: tuple[BacktestTrade, ...]
     data_quality_labels: tuple[str, ...]
     fill_quality_label: str
+    accounting_model: str = "legacy_usd_cashflow"
 
 
 def run_backtest(
@@ -58,8 +71,10 @@ def run_backtest(
     observations_by_leg: Mapping[str, Sequence[MarketObservation]],
     execution_model: ExecutionModel | None = None,
 ) -> BacktestResult:
+    """Execute a single-position backtest across common observation timestamps."""
     validate_strategy(strategy)
     execution = execution_model or ExecutionModel()
+    _validate_execution_model(execution)
     _validate_leg_data(strategy, observations_by_leg)
 
     leg_series = {
@@ -74,9 +89,10 @@ def run_backtest(
     entry_observations = _observations_at(leg_series, opened_at)
     entry_cashflow_usd = _portfolio_cashflow_usd(strategy, entry_observations, execution, is_entry=True)
 
-    exit_observations = entry_observations
+    # Initialize exit state to the final common observation in case no explicit exit rule triggers
     closed_at = common_timestamps[-1]
-    exit_reason = ExitType.TIME_EXIT.value
+    exit_observations = _observations_at(leg_series, closed_at)
+    exit_reason = "end_of_data"
 
     equity_curve = [0.0]
     for timestamp in common_timestamps[1:]:
@@ -115,23 +131,88 @@ def run_backtest(
         trades=(trade,),
         data_quality_labels=labels,
         fill_quality_label=execution.fill_quality_label,
+        accounting_model="legacy_usd_cashflow",
     )
+
+
+def _validate_execution_model(execution: ExecutionModel) -> None:
+    for name, val in [
+        ("slippage_bps", execution.slippage_bps),
+        ("fee_rate", execution.fee_rate),
+        ("min_fee_btc", execution.min_fee_btc),
+        ("premium_fee_cap_rate", execution.premium_fee_cap_rate),
+    ]:
+        _require_finite(val, name)
+        if val < 0:
+            raise BacktestEngineError(f"{name} cannot be negative")
 
 
 def _validate_leg_data(
     strategy: StrategyDefinition,
     observations_by_leg: Mapping[str, Sequence[MarketObservation]],
 ) -> None:
+    # Explicitly verify entry rules: legacy engine only supports immediate entry without filters/parameters
+    for rule in strategy.entry_rules:
+        rule_name = getattr(rule, "name", "")
+        if rule_name != "enter_when_chain_has_required_legs":
+            raise BacktestEngineError(
+                f"unsupported entry rule: {rule_name!r}. Legacy engine does not evaluate "
+                f"signal rules and only supports 'enter_when_chain_has_required_legs'. "
+                f"For general signal evaluation, use Task 10 signal engine."
+            )
+        rule_params = getattr(rule, "parameters", None)
+        if rule_params:
+            raise BacktestEngineError(
+                f"unsupported entry rule parameters: {rule_params!r}. Legacy engine does not evaluate "
+                f"signal or filter parameters on 'enter_when_chain_has_required_legs'. "
+                f"Parameters must be empty."
+            )
+
     for leg in strategy.legs:
         observations = observations_by_leg.get(leg.name)
         if not observations:
             raise BacktestEngineError(f"missing observations for leg: {leg.name}")
+
+        seen_timestamps = set()
+        expected_instrument = None
+
         for observation in observations:
+            # Reject duplicate timestamps within the same leg series
+            if observation.timestamp_utc in seen_timestamps:
+                raise BacktestEngineError(
+                    f"duplicate timestamp detected in leg {leg.name}: {observation.timestamp_utc}"
+                )
+            seen_timestamps.add(observation.timestamp_utc)
+
+            # Reject changing instrument names within the same leg series
+            if expected_instrument is None:
+                expected_instrument = observation.instrument_name
+            elif observation.instrument_name != expected_instrument:
+                raise BacktestEngineError(
+                    f"instrument changed within series for leg {leg.name}: "
+                    f"expected {expected_instrument}, got {observation.instrument_name}"
+                )
+
             if observation.option_type != leg.option_type:
                 raise BacktestEngineError(f"option type mismatch for leg: {leg.name}")
-            _require_positive(observation.trade_price_btc, "trade_price_btc")
+
+            # Numerical finiteness & non-negativity checks
+            _require_finite(observation.btc_usd, "btc_usd")
             _require_positive(observation.btc_usd, "btc_usd")
+            _require_finite(observation.underlying_price_usd, "underlying_price_usd")
             _require_positive(observation.underlying_price_usd, "underlying_price_usd")
+
+            # Trade price validation: settlement observations allow zero payout; standard trades require > 0
+            _require_finite(observation.trade_price_btc, "trade_price_btc")
+            is_settlement = (
+                getattr(observation, "is_settlement", False)
+                or observation.data_quality_label == "settlement"
+            )
+            if is_settlement:
+                if observation.trade_price_btc < 0:
+                    raise BacktestEngineError("settlement trade_price_btc cannot be negative")
+            else:
+                _require_positive(observation.trade_price_btc, "trade_price_btc")
 
 
 def _common_timestamps(series_collection: Sequence[Sequence[MarketObservation]]) -> list[datetime]:
@@ -244,3 +325,10 @@ def _max_drawdown(equity_curve: Sequence[float]) -> float:
 def _require_positive(value: float, field_name: str) -> None:
     if value <= 0:
         raise BacktestEngineError(f"{field_name} must be positive")
+
+
+def _require_finite(value: float, field_name: str) -> None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise BacktestEngineError(f"{field_name} must be a valid number")
+    if math.isnan(value) or math.isinf(value):
+        raise BacktestEngineError(f"{field_name} cannot be NaN or Infinity")

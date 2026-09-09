@@ -1,0 +1,32 @@
+[
+  {
+    "path": "strategies/backtest_engine.py",
+    "before_sha256": "199167c83c191c2240ea53c3ea68174ea3697da3bc9fa100fc668c8548813db1",
+    "after_sha256": "d877e4063c467036972feebdfa537b96f7d1d9698019877b50439219f5f08711",
+    "status": "modified"
+  },
+  {
+    "path": "tests/test_backtest_engine.py",
+    "before_sha256": "19f735f5214a66a90089b7e4dddfcaacafe1635f50a2a4755e3c5206041c9737",
+    "after_sha256": "8aeda9553654fe7552b55da722464eb914cff0f46c37309e066ef145f0283931",
+    "status": "modified"
+  },
+  {
+    "path": "reports/task-02/tests.txt",
+    "before_sha256": null,
+    "after_sha256": "552a298d85706fe3987c63f287ea41120b2375c4a782450542a998ca83753ae9",
+    "status": "created"
+  },
+  {
+    "path": "reports/task-02/changes.patch",
+    "before_sha256": null,
+    "after_sha256": "c34f5c6c273c680f89937e6b1d4bf9b3e15d77a4dcd60d795e877a32ab181988",
+    "status": "created"
+  },
+  {
+    "path": "reports/task-02/delivery.md",
+    "before_sha256": null,
+    "after_sha256": "a51982fc3b3fdf9377b772cca373af3304083892031c524bdac90255d3604439",
+    "status": "created"
+  }
+]

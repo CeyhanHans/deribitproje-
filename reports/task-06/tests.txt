@@ -1,0 +1,201 @@
+test_applies_slippage_and_fee_to_estimated_fill (test_backtest_engine.BacktestEngineTests.test_applies_slippage_and_fee_to_estimated_fill) ... ok
+test_changing_btc_usd_rate_fixtures (test_backtest_engine.BacktestEngineTests.test_changing_btc_usd_rate_fixtures)
+Verify USD cashflow conversion under rising and falling BTC/USD rates. ... ok
+test_inverse_option_fee_respects_twelve_point_five_percent_premium_cap (test_backtest_engine.BacktestEngineTests.test_inverse_option_fee_respects_twelve_point_five_percent_premium_cap) ... ok
+test_inverse_option_fee_uses_contract_amount_not_premium_rate (test_backtest_engine.BacktestEngineTests.test_inverse_option_fee_uses_contract_amount_not_premium_rate) ... ok
+test_rejects_duplicate_timestamps_within_leg_series (test_backtest_engine.BacktestEngineTests.test_rejects_duplicate_timestamps_within_leg_series)
+A leg cannot contain duplicate timestamps. ... ok
+test_rejects_instrument_change_within_leg_series (test_backtest_engine.BacktestEngineTests.test_rejects_instrument_change_within_leg_series)
+A leg's observations must keep the same instrument name throughout the series. ... ok
+test_rejects_missing_leg_observations (test_backtest_engine.BacktestEngineTests.test_rejects_missing_leg_observations) ... ok
+test_rejects_nan_and_infinity_in_observations (test_backtest_engine.BacktestEngineTests.test_rejects_nan_and_infinity_in_observations)
+NaN and Infinity in prices or rates must be rejected. ... ok
+test_rejects_negative_costs_in_execution_model (test_backtest_engine.BacktestEngineTests.test_rejects_negative_costs_in_execution_model)
+Negative slippage or fee rates must be rejected. ... ok
+test_rejects_unsupported_entry_rules (test_backtest_engine.BacktestEngineTests.test_rejects_unsupported_entry_rules)
+Legacy engine only supports 'enter_when_chain_has_required_legs'. ... ok
+test_runs_stop_loss_backtest (test_backtest_engine.BacktestEngineTests.test_runs_stop_loss_backtest) ... ok
+test_runs_two_leg_take_profit_backtest (test_backtest_engine.BacktestEngineTests.test_runs_two_leg_take_profit_backtest) ... ok
+test_untriggered_exit_rules_close_at_last_observation_price_not_entry (test_backtest_engine.BacktestEngineTests.test_untriggered_exit_rules_close_at_last_observation_price_not_entry)
+CRITICAL FIX: When no exit rule triggers, position must close at the final ... ok
+test_zero_settlement_price_allowed_while_zero_trade_price_rejected (test_backtest_engine.BacktestEngineTests.test_zero_settlement_price_allowed_while_zero_trade_price_rejected)
+A standard trade price of 0.0 is invalid, but a settlement price of 0.0 (OTM expiry) is valid. ... ok
+test_atm_selection_closest_common_strike (test_contract_catalog.ContractCatalogTests.test_atm_selection_closest_common_strike) ... ok
+test_benchmark_120k_synthetic_records_scale_and_candidates_measured (test_contract_catalog.ContractCatalogTests.test_benchmark_120k_synthetic_records_scale_and_candidates_measured)
+Verify performance and memory efficiency on 120,000 synthetic option records. ... ok
+test_creation_timestamp_lookahead_rejection (test_contract_catalog.ContractCatalogTests.test_creation_timestamp_lookahead_rejection) ... ok
+test_duplicate_deduplication_and_conflicting_record_rejection (test_contract_catalog.ContractCatalogTests.test_duplicate_deduplication_and_conflicting_record_rejection)
+Exact identical duplicate records are deduped; conflicting records raise error. ... ok
+test_empty_catalog_and_invalid_query_are_graceful (test_contract_catalog.ContractCatalogTests.test_empty_catalog_and_invalid_query_are_graceful) ... ok
+test_equidistant_tie_break_is_deterministic (test_contract_catalog.ContractCatalogTests.test_equidistant_tie_break_is_deterministic) ... ok
+test_expired_contract_rejection (test_contract_catalog.ContractCatalogTests.test_expired_contract_rejection) ... ok
+test_first_candidate_expiry_missing_leg_falls_back_to_second_expiry (test_contract_catalog.ContractCatalogTests.test_first_candidate_expiry_missing_leg_falls_back_to_second_expiry)
+If expiry 1 only has Call and no Put, catalog must evaluate next candidate expiry. ... ok
+test_future_expiry_created_in_past_accepted_even_if_is_active_false (test_contract_catalog.ContractCatalogTests.test_future_expiry_created_in_past_accepted_even_if_is_active_false)
+Historical contracts with is_active=False must be eligible as long as creation <= T < expiry. ... ok
+test_future_records_in_expired_catalog_are_filtered (test_contract_catalog.ContractCatalogTests.test_future_records_in_expired_catalog_are_filtered) ... ok
+test_mismatched_metadata_rejected (test_contract_catalog.ContractCatalogTests.test_mismatched_metadata_rejected)
+Mismatched option_type, strike, currency, or invalid timestamps must raise ContractCatalogError. ... ok
+test_missing_leg_returns_none (test_contract_catalog.ContractCatalogTests.test_missing_leg_returns_none) ... ok
+test_parametric_dte_and_target_expiry (test_contract_catalog.ContractCatalogTests.test_parametric_dte_and_target_expiry) ... ok
+test_result_is_repeatable (test_contract_catalog.ContractCatalogTests.test_result_is_repeatable) ... ok
+test_shuffled_input_determinism (test_contract_catalog.ContractCatalogTests.test_shuffled_input_determinism)
+Loading records in shuffled order produces byte-for-byte identical selection. ... ok
+test_strict_same_strike_and_expiry_enforcement (test_contract_catalog.ContractCatalogTests.test_strict_same_strike_and_expiry_enforcement) ... ok
+test_t_equal_creation_accepted_and_t_equal_expiry_rejected (test_contract_catalog.ContractCatalogTests.test_t_equal_creation_accepted_and_t_equal_expiry_rejected)
+At T == creation, contract is active. At T == expiry (0 DTE boundary), contract is rejected. ... ok
+test_financial_fields_serialize_as_strings (test_contracts_v1.TestContractsV1.test_financial_fields_serialize_as_strings)
+Verify that all Decimal fields serialize to JSON as strings, never raw floats. ... ok
+test_frozen_immutability (test_contracts_v1.TestContractsV1.test_frozen_immutability)
+Ensure all contract dataclasses are frozen and immutable. ... ok
+test_json_roundtrip_all_dataclasses (test_contracts_v1.TestContractsV1.test_json_roundtrip_all_dataclasses)
+Verify perfect round-trip serialization and deserialization for all dataclasses. ... ok
+test_provider_protocols_runtime_checkable (test_contracts_v1.TestContractsV1.test_provider_protocols_runtime_checkable)
+Verify provider protocols are runtime checkable. ... ok
+test_reject_bool_in_numeric_fields (test_contracts_v1.TestContractsV1.test_reject_bool_in_numeric_fields)
+Ensure boolean values are strictly rejected where numbers or timestamps are expected. ... ok
+test_reject_invalid_enum_values (test_contracts_v1.TestContractsV1.test_reject_invalid_enum_values)
+Ensure invalid enum strings are rejected upon construction and deserialization. ... ok
+test_reject_nan_and_infinity (test_contracts_v1.TestContractsV1.test_reject_nan_and_infinity)
+Ensure NaN and Infinity (float or Decimal) are rejected. ... ok
+test_schema_version_validation_and_mismatch (test_contracts_v1.TestContractsV1.test_schema_version_validation_and_mismatch)
+Validate strict schema_version enforcement. ... ok
+test_standard_library_only (test_contracts_v1.TestContractsV1.test_standard_library_only)
+Verify that core/contracts.py only imports standard library modules. ... ok
+test_time_range_and_lookahead_boundaries (test_contracts_v1.TestContractsV1.test_time_range_and_lookahead_boundaries)
+Validate [start, end) time ranges and lookahead prevention rules. ... ok
+test_api_error_is_reported (test_deribit_history.DeribitHistoryTests.test_api_error_is_reported) ... ok
+test_budget_cap_max_bytes (test_deribit_history.DeribitHistoryTests.test_budget_cap_max_bytes)
+fetch_trade_pages respects max_bytes limit. ... ok
+test_budget_cap_max_seconds (test_deribit_history.DeribitHistoryTests.test_budget_cap_max_seconds)
+fetch_trade_pages respects max_seconds limit. ... ok
+test_history_collector_uses_dedicated_history_host_by_default (test_deribit_history.DeribitHistoryTests.test_history_collector_uses_dedicated_history_host_by_default) ... ok
+test_http_400_is_non_retryable (test_deribit_history.DeribitHistoryTests.test_http_400_is_non_retryable)
+HTTP 400 Bad Request immediately fails without wasting retries. ... ok
+test_http_429_retry_after_respected (test_deribit_history.DeribitHistoryTests.test_http_429_retry_after_respected)
+HTTP 429 with Retry-After header backs off and succeeds on retry. ... ok
+test_rejects_count_above_official_limit (test_deribit_history.DeribitHistoryTests.test_rejects_count_above_official_limit) ... ok
+test_requires_exactly_one_range_mode (test_deribit_history.DeribitHistoryTests.test_requires_exactly_one_range_mode) ... ok
+test_retry_exhaustion_raises_deribit_history_error (test_deribit_history.DeribitHistoryTests.test_retry_exhaustion_raises_deribit_history_error)
+When retries are exhausted after max_retries attempts, raises DeribitHistoryError. ... ok
+test_sequence_fetch_summarizes_exact_coverage (test_deribit_history.DeribitHistoryTests.test_sequence_fetch_summarizes_exact_coverage) ... ok
+test_sequence_plan_defaults_to_count_1000_and_is_bounded (test_deribit_history.DeribitHistoryTests.test_sequence_plan_defaults_to_count_1000_and_is_bounded) ... ok
+test_server_error_500_retries_with_exponential_backoff (test_deribit_history.DeribitHistoryTests.test_server_error_500_retries_with_exponential_backoff)
+HTTP 500 server error retries with exponential backoff and succeeds. ... ok
+test_time_fetch_pages_toward_older_trades (test_deribit_history.DeribitHistoryTests.test_time_fetch_pages_toward_older_trades) ... ok
+test_time_plan_emits_single_initial_window_for_dry_run (test_deribit_history.DeribitHistoryTests.test_time_plan_emits_single_initial_window_for_dry_run) ... ok
+test_api_and_network_errors_are_safe (test_deribit_snapshot.DeribitSnapshotTests.test_api_and_network_errors_are_safe) ... ok
+test_fetches_single_public_order_book_snapshot (test_deribit_snapshot.DeribitSnapshotTests.test_fetches_single_public_order_book_snapshot) ... ok
+test_normalizes_order_book_option_fields (test_deribit_snapshot.DeribitSnapshotTests.test_normalizes_order_book_option_fields) ... ok
+test_requires_btc_option_instrument_name (test_deribit_snapshot.DeribitSnapshotTests.test_requires_btc_option_instrument_name) ... ok
+test_writes_snapshot_json_record (test_deribit_snapshot.DeribitSnapshotTests.test_writes_snapshot_json_record) ... ok
+test_compute_underlying_coverage (test_deribit_underlying.DeribitUnderlyingTests.test_compute_underlying_coverage) ... ok
+test_default_30_to_120_day_windows_stay_single_bounded_requests (test_deribit_underlying.DeribitUnderlyingTests.test_default_30_to_120_day_windows_stay_single_bounded_requests) ... ok
+test_fetch_underlying_bars_api_error (test_deribit_underlying.DeribitUnderlyingTests.test_fetch_underlying_bars_api_error) ... ok
+test_fetch_underlying_bars_network_error (test_deribit_underlying.DeribitUnderlyingTests.test_fetch_underlying_bars_network_error) ... ok
+test_fetch_underlying_bars_successful_mock (test_deribit_underlying.DeribitUnderlyingTests.test_fetch_underlying_bars_successful_mock) ... ok
+test_fetch_underlying_series_multi_chunk_mock (test_deribit_underlying.DeribitUnderlyingTests.test_fetch_underlying_series_multi_chunk_mock) ... ok
+test_find_missing_underlying_intervals (test_deribit_underlying.DeribitUnderlyingTests.test_find_missing_underlying_intervals) ... ok
+test_handles_no_data_or_empty_response (test_deribit_underlying.DeribitUnderlyingTests.test_handles_no_data_or_empty_response) ... ok
+test_merge_and_dedup_bars_conflicting_data_raises_error (test_deribit_underlying.DeribitUnderlyingTests.test_merge_and_dedup_bars_conflicting_data_raises_error) ... ok
+test_merge_and_dedup_bars_sorted_and_deduplicated (test_deribit_underlying.DeribitUnderlyingTests.test_merge_and_dedup_bars_sorted_and_deduplicated) ... ok
+test_parses_valid_tradingview_response (test_deribit_underlying.DeribitUnderlyingTests.test_parses_valid_tradingview_response) ... ok
+test_plans_360_day_window_into_bounded_contiguous_chunks (test_deribit_underlying.DeribitUnderlyingTests.test_plans_360_day_window_into_bounded_contiguous_chunks) ... ok
+test_proxy_quality_label_preserved (test_deribit_underlying.DeribitUnderlyingTests.test_proxy_quality_label_preserved) ... ok
+test_rejects_corrupted_negative_or_zero_prices (test_deribit_underlying.DeribitUnderlyingTests.test_rejects_corrupted_negative_or_zero_prices) ... ok
+test_rejects_corrupted_non_numeric_rows (test_deribit_underlying.DeribitUnderlyingTests.test_rejects_corrupted_non_numeric_rows) ... ok
+test_rejects_corrupted_ohlc_boundary_violation (test_deribit_underlying.DeribitUnderlyingTests.test_rejects_corrupted_ohlc_boundary_violation) ... ok
+test_rejects_misleading_instrument_index_metadata (test_deribit_underlying.DeribitUnderlyingTests.test_rejects_misleading_instrument_index_metadata) ... ok
+test_rejects_mismatched_array_lengths (test_deribit_underlying.DeribitUnderlyingTests.test_rejects_mismatched_array_lengths) ... ok
+test_rejects_missing_required_fields (test_deribit_underlying.DeribitUnderlyingTests.test_rejects_missing_required_fields) ... ok
+test_request_validation_invalid_fields (test_deribit_underlying.DeribitUnderlyingTests.test_request_validation_invalid_fields) ... ok
+test_request_validation_valid (test_deribit_underlying.DeribitUnderlyingTests.test_request_validation_valid) ... ok
+test_write_underlying_bars_json (test_deribit_underlying.DeribitUnderlyingTests.test_write_underlying_bars_json) ... ok
+test_aggregates_trades_into_hourly_ohlcv_bars (test_historical_windows.HistoricalWindowsTests.test_aggregates_trades_into_hourly_ohlcv_bars) ... ok
+test_build_trade_plan_uses_time_range (test_historical_windows.HistoricalWindowsTests.test_build_trade_plan_uses_time_range) ... ok
+test_default_windows_are_independent_and_hourly (test_historical_windows.HistoricalWindowsTests.test_default_windows_are_independent_and_hourly) ... ok
+test_fetch_hourly_trade_bars_marks_download_summary (test_historical_windows.HistoricalWindowsTests.test_fetch_hourly_trade_bars_marks_download_summary) ... ok
+test_window_validation_rejects_non_hourly_resolution (test_historical_windows.HistoricalWindowsTests.test_window_validation_rejects_non_hourly_resolution) ... ok
+test_write_window_bars_json (test_historical_windows.HistoricalWindowsTests.test_write_window_bars_json) ... ok
+test_boundary_inclusive_fixtures (test_history_download.HistoryDownloadTests.test_boundary_inclusive_fixtures)
+Trades on exact start_timestamp and end_timestamp are both captured. ... ok
+test_broken_connection_retries_and_recovers (test_history_download.HistoryDownloadTests.test_broken_connection_retries_and_recovers)
+Interrupted connection retries up to max_retries and recovers seamlessly. ... ok
+test_historical_trade_provider_protocol_and_tradetick_conversion (test_history_download.HistoryDownloadTests.test_historical_trade_provider_protocol_and_tradetick_conversion)
+DeribitHistoricalTradeProvider converts raw trades to immutable TradeTick contracts. ... ok
+test_max_bytes_budget_marks_incomplete (test_history_download.HistoryDownloadTests.test_max_bytes_budget_marks_incomplete)
+Downloader stops when max_bytes limit is reached, marking INCOMPLETE. ... ok
+test_max_seconds_budget_marks_incomplete (test_history_download.HistoryDownloadTests.test_max_seconds_budget_marks_incomplete)
+Downloader stops when wall-clock duration exceeds max_seconds. ... ok
+test_page_cap_budget_marks_incomplete (test_history_download.HistoryDownloadTests.test_page_cap_budget_marks_incomplete)
+Downloader stops when max_pages is reached, marking INCOMPLETE. ... ok
+test_repeated_page_boundary_inclusive_and_overlap_deduplication (test_history_download.HistoryDownloadTests.test_repeated_page_boundary_inclusive_and_overlap_deduplication)
+Boundary inclusive time queries repeat trades on the boundary; dedup removes them perfectly. ... ok
+test_resume_plus_dedup_produces_identical_result_to_uninterrupted_reference (test_history_download.HistoryDownloadTests.test_resume_plus_dedup_produces_identical_result_to_uninterrupted_reference)
+Interrupted run resumed from Store produces identical result to uninterrupted run. ... ok
+test_retry_exhaustion_marks_failure_in_manifest (test_history_download.HistoryDownloadTests.test_retry_exhaustion_marks_failure_in_manifest)
+When retries are exhausted, manifest documents FAILED status and error reason. ... ok
+test_reverse_and_unordered_rows_are_stably_sorted (test_history_download.HistoryDownloadTests.test_reverse_and_unordered_rows_are_stably_sorted)
+Incoming trades in arbitrary or reversed order are sorted deterministically. ... ok
+test_sequence_gap_analysis_tracks_diagnostics_without_false_accusation (test_history_download.HistoryDownloadTests.test_sequence_gap_analysis_tracks_diagnostics_without_false_accusation)
+Sequence gap analysis identifies missing numbers without blindly declaring data loss. ... ok
+test_single_millisecond_count_overflow_with_sequence_continuation (test_history_download.HistoryDownloadTests.test_single_millisecond_count_overflow_with_sequence_continuation)
+When more trades than count occur in the same millisecond, sequence continuation bridges across. ... ok
+test_single_millisecond_overflow_without_sequence_continuation_marks_incomplete (test_history_download.HistoryDownloadTests.test_single_millisecond_overflow_without_sequence_continuation_marks_incomplete)
+When sequence continuation is disabled and same-ms overflows, manifest marks INCOMPLETE. ... ok
+test_smoke_check_capped_at_max_20_requests (test_history_download.HistoryDownloadTests.test_smoke_check_capped_at_max_20_requests)
+run_live_smoke_check caps requests at max 20 even when called with higher value. ... ok
+test_store_implementations_in_memory_and_json_file (test_history_download.HistoryDownloadTests.test_store_implementations_in_memory_and_json_file)
+Both InMemoryStore and JsonFileStore satisfy the Store protocol. ... ok
+test_counts_asymmetric_missing_leg_without_stale_fill (test_leg_matcher.LegMatcherTests.test_counts_asymmetric_missing_leg_without_stale_fill) ... ok
+test_empty_inputs_report_all_hours_skipped (test_leg_matcher.LegMatcherTests.test_empty_inputs_report_all_hours_skipped) ... ok
+test_matches_fully_available_two_leg_hours (test_leg_matcher.LegMatcherTests.test_matches_fully_available_two_leg_hours) ... ok
+test_out_of_window_bars_do_not_count (test_leg_matcher.LegMatcherTests.test_out_of_window_bars_do_not_count) ... ok
+test_rejects_duplicate_bars_for_same_leg_hour (test_leg_matcher.LegMatcherTests.test_rejects_duplicate_bars_for_same_leg_hour) ... ok
+test_rejects_instrument_mismatch_for_leg (test_leg_matcher.LegMatcherTests.test_rejects_instrument_mismatch_for_leg) ... ok
+test_rejects_misaligned_buckets (test_leg_matcher.LegMatcherTests.test_rejects_misaligned_buckets) ... ok
+test_supports_three_legs (test_leg_matcher.LegMatcherTests.test_supports_three_legs) ... ok
+test_atm_call_and_put_zero_payoff (test_settlement.SettlementTests.test_atm_call_and_put_zero_payoff) ... ok
+test_daily_vs_other_expiry_fee_distinction (test_settlement.SettlementTests.test_daily_vs_other_expiry_fee_distinction) ... ok
+test_delivery_missing_prohibits_perpetual_close_substitution (test_settlement.SettlementTests.test_delivery_missing_prohibits_perpetual_close_substitution) ... ok
+test_exact_expiry_boundary (test_settlement.SettlementTests.test_exact_expiry_boundary) ... ok
+test_fee_schedule_historical_verification_status (test_settlement.SettlementTests.test_fee_schedule_historical_verification_status) ... ok
+test_is_daily_option_lifespan (test_settlement.SettlementTests.test_is_daily_option_lifespan) ... ok
+test_itm_call_long_and_short_payoff (test_settlement.SettlementTests.test_itm_call_long_and_short_payoff) ... ok
+test_itm_put_long_and_short_payoff (test_settlement.SettlementTests.test_itm_put_long_and_short_payoff) ... ok
+test_leap_day_utc_expiry (test_settlement.SettlementTests.test_leap_day_utc_expiry) ... ok
+test_otm_call_and_put_zero_payoff (test_settlement.SettlementTests.test_otm_call_and_put_zero_payoff) ... ok
+test_premium_fee_cap_and_delivery_fee_cap (test_settlement.SettlementTests.test_premium_fee_cap_and_delivery_fee_cap) ... ok
+test_rejects_negative_zero_nan_and_inf_inputs (test_settlement.SettlementTests.test_rejects_negative_zero_nan_and_inf_inputs) ... ok
+test_settlement_provider_protocol_conformance (test_settlement.SettlementTests.test_settlement_provider_protocol_conformance) ... ok
+test_settlement_provider_works_without_option_quote (test_settlement.SettlementTests.test_settlement_provider_works_without_option_quote) ... ok
+test_concurrent_multithreaded_readers (test_storage_v1.StorageV1Tests.test_concurrent_multithreaded_readers)
+Multiple concurrent threads stream trades without deadlock or error. ... ok
+test_export_and_import_bundle_offline_replay (test_storage_v1.StorageV1Tests.test_export_and_import_bundle_offline_replay)
+Export archives to offline bundle and import into a fresh engine instance. ... ok
+test_idempotent_re_store_and_conflicting_content_rejection (test_storage_v1.StorageV1Tests.test_idempotent_re_store_and_conflicting_content_rejection)
+Identical re-store succeeds; conflicting content for same range raises StorageConflictError. ... ok
+test_incomplete_manifest_never_returns_complete_cache_hit (test_storage_v1.StorageV1Tests.test_incomplete_manifest_never_returns_complete_cache_hit)
+CRITICAL: Incomplete manifest must NEVER be returned as a complete cache hit. ... ok
+test_interrupted_write_leaves_no_corrupt_index_entry (test_storage_v1.StorageV1Tests.test_interrupted_write_leaves_no_corrupt_index_entry)
+Simulate an interrupted write leaving a temp file; index remains uncorrupted. ... ok
+test_large_fixture_streaming_and_window_filtering (test_storage_v1.StorageV1Tests.test_large_fixture_streaming_and_window_filtering)
+Stream 5,000 trades efficiently with timestamp filtering. ... ok
+test_path_traversal_attempts_are_rejected (test_storage_v1.StorageV1Tests.test_path_traversal_attempts_are_rejected)
+Attempts to access paths with '..' or escape the root directory raise StorageSecurityError. ... ok
+test_price_and_quantity_exact_decimal_roundtrip (test_storage_v1.StorageV1Tests.test_price_and_quantity_exact_decimal_roundtrip)
+Verify TradeTick price and quantity retain exact Decimal precision through storage. ... ok
+test_store_protocol_put_get_query_resume_state (test_storage_v1.StorageV1Tests.test_store_protocol_put_get_query_resume_state)
+Verify TradeStorageEngine fully satisfies the Store protocol. ... ok
+test_tampered_archive_raises_storage_checksum_error (test_storage_v1.StorageV1Tests.test_tampered_archive_raises_storage_checksum_error)
+Tampering with an archive file is detected by checksum verification. ... ok
+test_accepts_configurable_multi_leg_strategy (test_strategy_schema.StrategySchemaTests.test_accepts_configurable_multi_leg_strategy) ... ok
+test_rejects_fixed_or_missing_leg_fields (test_strategy_schema.StrategySchemaTests.test_rejects_fixed_or_missing_leg_fields) ... ok
+test_rejects_prediction_accuracy_metric_name (test_strategy_schema.StrategySchemaTests.test_rejects_prediction_accuracy_metric_name) ... ok
+test_rejects_unknown_fee_spread_model_reference (test_strategy_schema.StrategySchemaTests.test_rejects_unknown_fee_spread_model_reference) ... ok
+test_requires_net_usd_exit_thresholds_to_be_configurable_positive_values (test_strategy_schema.StrategySchemaTests.test_requires_net_usd_exit_thresholds_to_be_configurable_positive_values) ... ok
+
+----------------------------------------------------------------------
+Ran 140 tests in 1.201s
+
+OK

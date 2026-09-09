@@ -1,0 +1,1825 @@
+diff --git a/ingestion/deribit_history.py b/ingestion/deribit_history.py
+index 08a99aa..267e4b7 100644
+--- a/ingestion/deribit_history.py
++++ b/ingestion/deribit_history.py
+@@ -1,17 +1,26 @@
+-"""Small, bounded Deribit History API trade downloader.
+-
+-The adapter is intentionally narrow: one instrument, one sequence or time range,
+-and an explicit page cap. It uses only Deribit's public history endpoint and does
+-not require API keys.
++"""Bounded and resilient Deribit History API trade downloader.
++
++Official Reference:
++  Deribit API v2 Public History Endpoints
++  Documentation: https://docs.deribit.com/
++  Verified: 2026-09-09
++  Endpoints:
++    - /public/get_last_trades_by_instrument
++    - /public/get_last_trades_by_instrument_and_time
++  Default Host: https://history.deribit.com/api/v2/public
++  Count Limit: 1..1000 per request
++  HTTP 429: Rate limit backoff with Retry-After header
++  Error format: {"jsonrpc": "2.0", "error": {"code": int, "message": str}}
+ """
+ 
+ from __future__ import annotations
+ 
+ import argparse
+ import json
++import time
+ from dataclasses import asdict, dataclass
+ from pathlib import Path
+-from typing import Any
++from typing import Any, Callable
+ from urllib.error import HTTPError, URLError
+ from urllib.parse import urlencode
+ from urllib.request import Request, urlopen
+@@ -20,6 +29,9 @@ DEFAULT_BASE_URL = "https://history.deribit.com/api/v2/public"
+ DEFAULT_COUNT = 1000
+ MAX_COUNT = 1000
+ DEFAULT_MAX_PAGES = 1
++DEFAULT_TIMEOUT_SECONDS = 30.0
++DEFAULT_MAX_RETRIES = 5
++DEFAULT_BACKOFF_FACTOR = 0.5
+ 
+ 
+ class DeribitHistoryError(RuntimeError):
+@@ -38,6 +50,12 @@ class TradeDownloadPlan:
+     end_seq: int | None = None
+     start_timestamp: int | None = None
+     end_timestamp: int | None = None
++    sorting: str = "default"
++    overlap_boundary: bool = False
++    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
++    max_retries: int = DEFAULT_MAX_RETRIES
++    max_bytes: int | None = None
++    max_seconds: float | None = None
+ 
+     def validate(self) -> None:
+         if not self.instrument_name:
+@@ -48,6 +66,15 @@ class TradeDownloadPlan:
+             raise ValueError(f"count must be <= {MAX_COUNT}")
+         if self.max_pages < 1:
+             raise ValueError("max_pages must be >= 1")
++        if self.timeout_seconds <= 0:
++            raise ValueError("timeout_seconds must be > 0")
++        if self.max_retries < 1:
++            raise ValueError("max_retries must be >= 1")
++        if self.max_bytes is not None and self.max_bytes < 1:
++            raise ValueError("max_bytes must be >= 1")
++        if self.max_seconds is not None and self.max_seconds <= 0:
++            raise ValueError("max_seconds must be > 0")
++
+         if self.mode == "sequence":
+             if self.start_seq is None or self.end_seq is None:
+                 raise ValueError("sequence mode requires start_seq and end_seq")
+@@ -73,6 +100,7 @@ class TradePage:
+     trade_count: int
+     has_more: bool
+     trades: list[dict[str, Any]]
++    byte_size: int = 0
+ 
+ 
+ def build_sequence_plan(
+@@ -83,6 +111,11 @@ def build_sequence_plan(
+     count: int = DEFAULT_COUNT,
+     max_pages: int = DEFAULT_MAX_PAGES,
+     base_url: str = DEFAULT_BASE_URL,
++    sorting: str = "default",
++    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
++    max_retries: int = DEFAULT_MAX_RETRIES,
++    max_bytes: int | None = None,
++    max_seconds: float | None = None,
+ ) -> TradeDownloadPlan:
+     plan = TradeDownloadPlan(
+         instrument_name=instrument_name,
+@@ -93,6 +126,11 @@ def build_sequence_plan(
+         base_url=base_url,
+         start_seq=start_seq,
+         end_seq=end_seq,
++        sorting=sorting,
++        timeout_seconds=timeout_seconds,
++        max_retries=max_retries,
++        max_bytes=max_bytes,
++        max_seconds=max_seconds,
+     )
+     plan.validate()
+     return plan
+@@ -106,6 +144,12 @@ def build_time_plan(
+     count: int = DEFAULT_COUNT,
+     max_pages: int = DEFAULT_MAX_PAGES,
+     base_url: str = DEFAULT_BASE_URL,
++    sorting: str = "default",
++    overlap_boundary: bool = False,
++    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
++    max_retries: int = DEFAULT_MAX_RETRIES,
++    max_bytes: int | None = None,
++    max_seconds: float | None = None,
+ ) -> TradeDownloadPlan:
+     plan = TradeDownloadPlan(
+         instrument_name=instrument_name,
+@@ -116,6 +160,12 @@ def build_time_plan(
+         base_url=base_url,
+         start_timestamp=start_timestamp,
+         end_timestamp=end_timestamp,
++        sorting=sorting,
++        overlap_boundary=overlap_boundary,
++        timeout_seconds=timeout_seconds,
++        max_retries=max_retries,
++        max_bytes=max_bytes,
++        max_seconds=max_seconds,
+     )
+     plan.validate()
+     return plan
+@@ -131,70 +181,208 @@ def planned_requests(plan: TradeDownloadPlan) -> list[dict[str, Any]]:
+         start_seq = plan.start_seq
+         while start_seq <= plan.end_seq and len(requests) < plan.max_pages:
+             end_seq = min(start_seq + plan.count - 1, plan.end_seq)
+-            requests.append(
+-                {
+-                    "instrument_name": plan.instrument_name,
+-                    "start_seq": start_seq,
+-                    "end_seq": end_seq,
+-                    "count": plan.count,
+-                }
+-            )
++            req: dict[str, Any] = {
++                "instrument_name": plan.instrument_name,
++                "start_seq": start_seq,
++                "end_seq": end_seq,
++                "count": plan.count,
++            }
++            if plan.sorting != "default":
++                req["sorting"] = plan.sorting
++            requests.append(req)
+             start_seq = end_seq + 1
+         return requests
+ 
+     assert plan.start_timestamp is not None
+     assert plan.end_timestamp is not None
+-    return [
+-        {
+-            "instrument_name": plan.instrument_name,
+-            "start_timestamp": plan.start_timestamp,
+-            "end_timestamp": plan.end_timestamp,
+-            "count": plan.count,
+-        }
+-    ]
++    req_time: dict[str, Any] = {
++        "instrument_name": plan.instrument_name,
++        "start_timestamp": plan.start_timestamp,
++        "end_timestamp": plan.end_timestamp,
++        "count": plan.count,
++    }
++    if plan.sorting != "default":
++        req_time["sorting"] = plan.sorting
++    return [req_time]
++
++
++def fetch_deribit_json(
++    base_url: str,
++    endpoint: str,
++    params: dict[str, Any],
++    *,
++    timeout: float = DEFAULT_TIMEOUT_SECONDS,
++    max_retries: int = DEFAULT_MAX_RETRIES,
++    backoff_factor: float = DEFAULT_BACKOFF_FACTOR,
++    sleeper: Callable[[float], None] = time.sleep,
++) -> tuple[dict[str, Any], int]:
++    """Fetch JSON from Deribit public API with timeout, retries, 429 Retry-After, and backoff.
++
++    Official Reference: Deribit API v2 public specification (verified 2026-09-09).
++    """
++    url = f"{base_url.rstrip('/')}/{endpoint.lstrip('/')}?{urlencode(params)}"
++    request = Request(url, headers={"User-Agent": "deribit-backtest-catalog/0.1"})
++
++    last_error: Exception | None = None
++    for attempt in range(1, max_retries + 1):
++        try:
++            with urlopen(request, timeout=timeout) as response:
++                raw_bytes = response.read()
++                byte_size = len(raw_bytes)
++                payload = json.loads(raw_bytes.decode("utf-8"))
++
++            if "error" in payload:
++                error = payload["error"]
++                # JSON-RPC error: client/logical error, non-retryable
++                raise DeribitHistoryError(
++                    f"Deribit API error {error.get('code')}: {error.get('message')}"
++                )
++
++            result = payload.get("result")
++            if not isinstance(result, dict):
++                raise DeribitHistoryError("Deribit response missing result object")
++
++            return result, byte_size
++
++        except HTTPError as exc:
++            last_error = exc
++            if exc.code == 429:
++                retry_after_str = None
++                if getattr(exc, "headers", None):
++                    retry_after_str = exc.headers.get("Retry-After")
++                try:
++                    retry_seconds = float(retry_after_str) if retry_after_str else backoff_factor * (2 ** (attempt - 1))
++                except (ValueError, TypeError):
++                    retry_seconds = backoff_factor * (2 ** (attempt - 1))
++                if attempt < max_retries:
++                    sleeper(retry_seconds)
++                    continue
++                raise DeribitHistoryError(f"HTTP 429 Rate Limit exceeded after {max_retries} retries") from exc
++            elif exc.code in (500, 502, 503, 504):
++                if attempt < max_retries:
++                    sleeper(backoff_factor * (2 ** (attempt - 1)))
++                    continue
++                raise DeribitHistoryError(f"HTTP {exc.code} server error after {max_retries} retries") from exc
++            else:
++                # Client error (e.g. 400, 404): non-retryable
++                raise DeribitHistoryError(f"HTTP {exc.code} from Deribit history API") from exc
++
++        except (URLError, TimeoutError, ConnectionError, OSError) as exc:
++            last_error = exc
++            if attempt < max_retries:
++                sleeper(backoff_factor * (2 ** (attempt - 1)))
++                continue
++            raise DeribitHistoryError(f"Could not reach Deribit history API after {max_retries} retries: {exc}") from exc
++
++    raise DeribitHistoryError(f"Request failed after {max_retries} retries: {last_error}")
++
++
++def _fetch_result(
++    base_url: str,
++    endpoint: str,
++    params: dict[str, Any],
++    *,
++    timeout: float = DEFAULT_TIMEOUT_SECONDS,
++    max_retries: int = DEFAULT_MAX_RETRIES,
++    backoff_factor: float = DEFAULT_BACKOFF_FACTOR,
++    sleeper: Callable[[float], None] = time.sleep,
++) -> dict[str, Any]:
++    result, _ = fetch_deribit_json(
++        base_url,
++        endpoint,
++        params,
++        timeout=timeout,
++        max_retries=max_retries,
++        backoff_factor=backoff_factor,
++        sleeper=sleeper,
++    )
++    return result
+ 
+ 
+-def fetch_trade_pages(plan: TradeDownloadPlan) -> list[TradePage]:
++def fetch_trade_pages(
++    plan: TradeDownloadPlan,
++    *,
++    sleeper: Callable[[float], None] = time.sleep,
++) -> list[TradePage]:
+     """Fetch pages for the bounded plan.
+ 
+-    Sequence mode advances with fixed `count`-sized sequence windows. Time mode
+-    pages older trades by moving `end_timestamp` to the oldest returned
+-    timestamp minus one millisecond; for dense same-millisecond trades, prefer
+-    sequence mode for exact coverage checks.
++    Supports timeout, retry with backoff, 429 rate limit backoff, max_pages,
++    max_bytes, and max_seconds constraints.
+     """
+     plan.validate()
+     pages: list[TradePage] = []
++    total_bytes = 0
++    start_wall_time = time.monotonic()
++
++    def check_budgets() -> bool:
++        if plan.max_bytes is not None and total_bytes >= plan.max_bytes:
++            return False
++        if plan.max_seconds is not None and (time.monotonic() - start_wall_time) >= plan.max_seconds:
++            return False
++        return True
+ 
+     if plan.mode == "sequence":
+         for page_no, params in enumerate(planned_requests(plan), start=1):
+-            result = _fetch_result(plan.base_url, plan.endpoint, params)
++            if not check_budgets():
++                break
++            result, byte_size = fetch_deribit_json(
++                plan.base_url,
++                plan.endpoint,
++                params,
++                timeout=plan.timeout_seconds,
++                max_retries=plan.max_retries,
++                sleeper=sleeper,
++            )
++            total_bytes += byte_size
+             trades = result.get("trades", [])
+             if not isinstance(trades, list):
+                 raise DeribitHistoryError("Deribit response result.trades is not a list")
+-            pages.append(_page_from_result(page_no, params, result, trades))
++            pages.append(_page_from_result(page_no, params, result, trades, byte_size=byte_size))
++            if not result.get("has_more") or not trades:
++                break
+         return pages
+ 
+     assert plan.start_timestamp is not None
+     assert plan.end_timestamp is not None
+     next_end = plan.end_timestamp
++
+     for page_no in range(1, plan.max_pages + 1):
+-        params = {
++        if not check_budgets():
++            break
++        params: dict[str, Any] = {
+             "instrument_name": plan.instrument_name,
+             "start_timestamp": plan.start_timestamp,
+             "end_timestamp": next_end,
+             "count": plan.count,
+         }
+-        result = _fetch_result(plan.base_url, plan.endpoint, params)
++        if plan.sorting != "default":
++            params["sorting"] = plan.sorting
++
++        result, byte_size = fetch_deribit_json(
++            plan.base_url,
++            plan.endpoint,
++            params,
++            timeout=plan.timeout_seconds,
++            max_retries=plan.max_retries,
++            sleeper=sleeper,
++        )
++        total_bytes += byte_size
+         trades = result.get("trades", [])
+         if not isinstance(trades, list):
+             raise DeribitHistoryError("Deribit response result.trades is not a list")
+-        pages.append(_page_from_result(page_no, params, result, trades))
++        pages.append(_page_from_result(page_no, params, result, trades, byte_size=byte_size))
+         if not result.get("has_more") or not trades:
+             break
+         timestamps = [int(row["timestamp"]) for row in trades if "timestamp" in row]
+         if not timestamps:
+             break
+-        next_end = min(timestamps) - 1
++
++        min_ts = min(timestamps)
++        if plan.overlap_boundary:
++            next_end = min_ts  # Boundary inclusive
++        else:
++            next_end = min_ts - 1  # Legacy exclusive
++
+         if next_end < plan.start_timestamp:
+             break
+     return pages
+@@ -202,11 +390,13 @@ def fetch_trade_pages(plan: TradeDownloadPlan) -> list[TradePage]:
+ 
+ def summarize_download(plan: TradeDownloadPlan, pages: list[TradePage]) -> dict[str, Any]:
+     all_trades = [trade for page in pages for trade in page.trades]
++    total_bytes = sum(page.byte_size for page in pages)
+     summary: dict[str, Any] = {
+         "instrument_name": plan.instrument_name,
+         "mode": plan.mode,
+         "page_count": len(pages),
+         "trade_count": len(all_trades),
++        "total_bytes": total_bytes,
+         "any_has_more": any(page.has_more for page in pages),
+         "last_has_more": pages[-1].has_more if pages else False,
+         "page_cap_reached": len(pages) >= plan.max_pages,
+@@ -244,38 +434,12 @@ def write_json(path: Path, plan: TradeDownloadPlan, pages: list[TradePage]) -> N
+     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+ 
+ 
+-def _fetch_result(
+-    base_url: str,
+-    endpoint: str,
+-    params: dict[str, Any],
+-) -> dict[str, Any]:
+-    url = f"{base_url.rstrip('/')}/{endpoint.lstrip('/')}?{urlencode(params)}"
+-    request = Request(url, headers={"User-Agent": "deribit-backtest-catalog/0.1"})
+-    try:
+-        with urlopen(request, timeout=30) as response:
+-            payload = json.loads(response.read().decode("utf-8"))
+-    except HTTPError as exc:
+-        raise DeribitHistoryError(f"HTTP {exc.code} from Deribit history API") from exc
+-    except URLError as exc:
+-        raise DeribitHistoryError(f"Could not reach Deribit history API: {exc}") from exc
+-
+-    if "error" in payload:
+-        error = payload["error"]
+-        raise DeribitHistoryError(
+-            f"Deribit API error {error.get('code')}: {error.get('message')}"
+-        )
+-
+-    result = payload.get("result")
+-    if not isinstance(result, dict):
+-        raise DeribitHistoryError("Deribit response missing result object")
+-    return result
+-
+-
+ def _page_from_result(
+     page_no: int,
+     params: dict[str, Any],
+     result: dict[str, Any],
+     trades: list[dict[str, Any]],
++    byte_size: int = 0,
+ ) -> TradePage:
+     return TradePage(
+         page_no=page_no,
+@@ -283,6 +447,7 @@ def _page_from_result(
+         trade_count=len(trades),
+         has_more=bool(result.get("has_more")),
+         trades=trades,
++        byte_size=byte_size,
+     )
+ 
+ 
+@@ -298,6 +463,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+     parser.add_argument("--count", type=int, default=DEFAULT_COUNT)
+     parser.add_argument("--max-pages", type=int, default=DEFAULT_MAX_PAGES)
+     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
++    parser.add_argument("--sorting", default="default", choices=["default", "asc", "desc"])
++    parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS)
++    parser.add_argument("--max-retries", type=int, default=DEFAULT_MAX_RETRIES)
++    parser.add_argument("--max-bytes", type=int)
++    parser.add_argument("--max-seconds", type=float)
+     parser.add_argument("--output", type=Path)
+     parser.add_argument(
+         "--dry-run",
+@@ -320,6 +490,11 @@ def _plan_from_args(args: argparse.Namespace) -> TradeDownloadPlan:
+             count=args.count,
+             max_pages=args.max_pages,
+             base_url=args.base_url,
++            sorting=args.sorting,
++            timeout_seconds=args.timeout,
++            max_retries=args.max_retries,
++            max_bytes=args.max_bytes,
++            max_seconds=args.max_seconds,
+         )
+     return build_time_plan(
+         args.instrument_name,
+@@ -328,6 +503,11 @@ def _plan_from_args(args: argparse.Namespace) -> TradeDownloadPlan:
+         count=args.count,
+         max_pages=args.max_pages,
+         base_url=args.base_url,
++        sorting=args.sorting,
++        timeout_seconds=args.timeout,
++        max_retries=args.max_retries,
++        max_bytes=args.max_bytes,
++        max_seconds=args.max_seconds,
+     )
+ 
+ 
+diff --git a/ingestion/history_download.py b/ingestion/history_download.py
+new file mode 100644
+index 0000000..9d328f3
+--- /dev/null
++++ b/ingestion/history_download.py
+@@ -0,0 +1,671 @@
++"""Lossless, resumable historical trade download engine for Deribit options.
++
++Official API Reference & Semantics:
++  Date Verified: 2026-09-09
++  Source: Deribit API v2 Official Documentation (https://docs.deribit.com/)
++  Endpoints:
++    - /public/get_last_trades_by_instrument_and_time:
++        Parameters: instrument_name (str), start_timestamp (int ms), end_timestamp (int ms),
++                    count (int 1..1000), sorting ("asc" | "desc" | "default").
++        Response: {"jsonrpc": "2.0", "result": {"trades": [...], "has_more": bool}}
++    - /public/get_last_trades_by_instrument:
++        Parameters: instrument_name (str), start_seq (int), end_seq (int),
++                    count (int 1..1000), sorting ("asc" | "desc" | "default").
++        Response: {"jsonrpc": "2.0", "result": {"trades": [...], "has_more": bool}}
++  Host Architecture:
++    - Dedicated History Host: https://history.deribit.com/api/v2/public (Default)
++    - Production Live Host: https://www.deribit.com/api/v2/public
++  Rate Limits & Error Handling:
++    - HTTP 429: Too Many Requests; respect Retry-After header.
++    - JSON-RPC -32602: Invalid params (non-retryable client error).
++"""
++
++from __future__ import annotations
++
++import hashlib
++import json
++import time
++from dataclasses import asdict, dataclass, field
++from decimal import Decimal
++from pathlib import Path
++from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
++
++from core.contracts import (
++    DownloadResult,
++    HistoricalTradeProvider,
++    Store,
++    TradeTick,
++    ValidationError,
++)
++from ingestion.deribit_history import (
++    DEFAULT_BACKOFF_FACTOR,
++    DEFAULT_BASE_URL,
++    DEFAULT_COUNT,
++    DEFAULT_MAX_RETRIES,
++    DEFAULT_TIMEOUT_SECONDS,
++    MAX_COUNT,
++    DeribitHistoryError,
++    fetch_deribit_json,
++)
++
++SCHEMA_VERSION = "1.0"
++MAX_SMOKE_REQUESTS = 20
++
++
++# ==============================================================================
++# 1. Trade Sorting & Deduplication
++# ==============================================================================
++
++def trade_identity_key(trade: dict[str, Any]) -> tuple[int, int, str]:
++    """Extract a canonical identity key (timestamp, trade_seq, trade_id) for sorting and dedup."""
++    ts = int(trade.get("timestamp", 0))
++    seq = int(trade.get("trade_seq", 0)) if trade.get("trade_seq") is not None else 0
++    trade_id = str(trade.get("trade_id", ""))
++    return (ts, seq, trade_id)
++
++
++def sort_trades(trades: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
++    """Deterministically sort trades by (timestamp, trade_seq, trade_id)."""
++    return sorted(trades, key=trade_identity_key)
++
++
++def deduplicate_trades(trades: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
++    """Deduplicate trades while preserving deterministic sort order.
++
++    Deduplication matches on trade_seq (if positive) and trade_id.
++    """
++    seen: set[tuple[int, str]] = set()
++    unique: list[dict[str, Any]] = []
++
++    for t in sort_trades(trades):
++        seq = int(t.get("trade_seq", 0)) if t.get("trade_seq") is not None else 0
++        tid = str(t.get("trade_id", ""))
++        key = (seq, tid)
++        if key == (0, ""):
++            # Fallback to timestamp if neither seq nor id is present
++            ts_key = (int(t.get("timestamp", 0)), str(t))
++            if ts_key in seen:
++                continue
++            seen.add(ts_key)  # type: ignore[arg-type]
++            unique.append(t)
++        else:
++            if key in seen:
++                continue
++            seen.add(key)
++            unique.append(t)
++
++    return unique
++
++
++# ==============================================================================
++# 2. Sequence Gap Analysis
++# ==============================================================================
++
++def analyze_sequence_gaps(trades: Sequence[dict[str, Any]]) -> dict[str, Any]:
++    """Analyze sequence numbers without jumping to unwarranted conclusions.
++
++    Rationale:
++    In Deribit's architecture, trade_seq numbers are monotonic across matching engines.
++    An option instrument may show sequence gaps because trades on other instruments
++    or non-trade matching events incremented the sequence counter.
++    Therefore, an observed sequence gap DOES NOT necessarily prove missing data
++    unless corroborated by an incomplete range response.
++    """
++    if not trades:
++        return {
++            "total_trades": 0,
++            "min_seq": None,
++            "max_seq": None,
++            "unique_seq_count": 0,
++            "gap_count": 0,
++            "gaps": [],
++            "is_contiguous": True,
++            "interpretation": "empty_trades",
++        }
++
++    seqs = sorted({int(t["trade_seq"]) for t in trades if "trade_seq" in t and t["trade_seq"] is not None})
++    if not seqs:
++        return {
++            "total_trades": len(trades),
++            "min_seq": None,
++            "max_seq": None,
++            "unique_seq_count": 0,
++            "gap_count": 0,
++            "gaps": [],
++            "is_contiguous": True,
++            "interpretation": "no_sequence_numbers_in_trades",
++        }
++
++    min_seq = seqs[0]
++    max_seq = seqs[-1]
++    expected_count = max_seq - min_seq + 1
++    unique_count = len(seqs)
++    gap_count = expected_count - unique_count
++
++    gaps: list[tuple[int, int]] = []
++    if gap_count > 0:
++        for i in range(len(seqs) - 1):
++            curr_s = seqs[i]
++            next_s = seqs[i + 1]
++            if next_s > curr_s + 1:
++                gaps.append((curr_s + 1, next_s - 1))
++
++    return {
++        "total_trades": len(trades),
++        "min_seq": min_seq,
++        "max_seq": max_seq,
++        "unique_seq_count": unique_count,
++        "gap_count": gap_count,
++        "gaps": gaps,
++        "is_contiguous": gap_count == 0,
++        "interpretation": (
++            "strictly_contiguous" if gap_count == 0 else
++            f"gaps_detected: {gap_count} non-consecutive sequence numbers observed. Note: On Deribit, sequence gaps may arise from exchange-level counter progression across instruments and do not automatically indicate download failure."
++        ),
++    }
++
++
++# ==============================================================================
++# 3. Storage Protocol Implementations
++# ==============================================================================
++
++class InMemoryStore:
++    """In-memory implementation of the Store protocol for caching and testing."""
++
++    def __init__(self) -> None:
++        self._store: dict[str, bytes] = {}
++
++    def put(self, key: str, value: bytes) -> None:
++        self._store[key] = value
++
++    def get(self, key: str) -> Optional[bytes]:
++        return self._store.get(key)
++
++    def query(self, prefix: str) -> Iterator[Tuple[str, bytes]]:
++        for k in sorted(self._store.keys()):
++            if k.startswith(prefix):
++                yield (k, self._store[k])
++
++    def resume_state(self) -> Dict[str, Any]:
++        raw = self.get("resume_cursor")
++        if raw:
++            return json.loads(raw.decode("utf-8"))
++        return {}
++
++
++class JsonFileStore:
++    """Disk-backed implementation of the Store protocol using JSON/binary files."""
++
++    def __init__(self, root_dir: Path | str) -> None:
++        self.root = Path(root_dir)
++        self.root.mkdir(parents=True, exist_ok=True)
++
++    def _path_for(self, key: str) -> Path:
++        safe_key = key.replace("/", "_").replace("\\", "_")
++        return self.root / safe_key
++
++    def put(self, key: str, value: bytes) -> None:
++        p = self._path_for(key)
++        p.write_bytes(value)
++
++    def get(self, key: str) -> Optional[bytes]:
++        p = self._path_for(key)
++        if p.exists() and p.is_file():
++            return p.read_bytes()
++        return None
++
++    def query(self, prefix: str) -> Iterator[Tuple[str, bytes]]:
++        safe_prefix = prefix.replace("/", "_").replace("\\", "_")
++        for item in sorted(self.root.glob(f"{safe_prefix}*")):
++            if item.is_file():
++                yield (item.name, item.read_bytes())
++
++    def resume_state(self) -> Dict[str, Any]:
++        raw = self.get("resume_cursor")
++        if raw:
++            return json.loads(raw.decode("utf-8"))
++        return {}
++
++
++# ==============================================================================
++# 4. Download Plan & Completeness Manifest
++# ==============================================================================
++
++@dataclass(frozen=True)
++class HistoryDownloadPlan:
++    """Immutable plan specifying what historical trade data to download."""
++    instrument_name: str
++    start_timestamp: int
++    end_timestamp: int
++    count: int = DEFAULT_COUNT
++    max_pages: int = 100
++    max_bytes: int | None = None
++    max_seconds: float | None = None
++    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS
++    max_retries: int = DEFAULT_MAX_RETRIES
++    base_url: str = DEFAULT_BASE_URL
++    sorting: str = "asc"
++    enable_sequence_continuation: bool = True
++
++    def validate(self) -> None:
++        if not self.instrument_name:
++            raise ValueError("instrument_name cannot be empty")
++        if self.start_timestamp < 0 or self.end_timestamp < 0:
++            raise ValueError("timestamps must be non-negative")
++        if self.start_timestamp > self.end_timestamp:
++            raise ValueError(f"start_timestamp ({self.start_timestamp}) cannot exceed end_timestamp ({self.end_timestamp})")
++        if self.count < 1 or self.count > MAX_COUNT:
++            raise ValueError(f"count must be between 1 and {MAX_COUNT}")
++        if self.max_pages < 1:
++            raise ValueError("max_pages must be >= 1")
++        if self.timeout_seconds <= 0:
++            raise ValueError("timeout_seconds must be positive")
++        if self.max_retries < 1:
++            raise ValueError("max_retries must be >= 1")
++        if self.sorting not in ("asc", "desc"):
++            raise ValueError("sorting must be 'asc' or 'desc'")
++
++
++@dataclass(frozen=True)
++class CompletenessManifest:
++    """Manifest documenting the actual execution, coverage completeness, and audit trail."""
++    schema_version: str
++    instrument_name: str
++    requested_start_ms: int
++    requested_end_ms: int
++    actual_start_ms: int | None
++    actual_end_ms: int | None
++    is_complete: bool
++    status: str  # "COMPLETE", "INCOMPLETE", "EMPTY", "FAILED"
++    reason_code: str
++    total_trades_received: int
++    unique_trades_count: int
++    pages_fetched: int
++    total_bytes_fetched: int
++    elapsed_seconds: float
++    sequence_gaps_analysis: dict[str, Any]
++    trades_sha256: str
++    resume_cursor: dict[str, Any] | None = None
++
++    def to_dict(self) -> dict[str, Any]:
++        return asdict(self)
++
++
++# ==============================================================================
++# 5. Lossless Historical Downloader Engine
++# ==============================================================================
++
++class LosslessHistoryDownloader:
++    """Resilient, boundary-loss-free historical trade downloader for Deribit options."""
++
++    def __init__(self, plan: HistoryDownloadPlan) -> None:
++        plan.validate()
++        self.plan = plan
++
++    def download(
++        self,
++        *,
++        store: Store | None = None,
++        resume: bool = False,
++        sleeper: Callable[[float], None] = time.sleep,
++    ) -> tuple[list[dict[str, Any]], CompletenessManifest]:
++        """Execute lossless trade download with overlap deduplication and sequence continuation."""
++        start_wall_time = time.monotonic()
++        collected_trades: list[dict[str, Any]] = []
++        seen_keys: set[tuple[int, str]] = set()
++
++        current_start = self.plan.start_timestamp
++        current_end = self.plan.end_timestamp
++        pages_fetched = 0
++        total_bytes_fetched = 0
++        is_complete = True
++        status = "COMPLETE"
++        reason_code = "full_range_covered"
++
++        # Resume state restoration
++        if resume and store is not None:
++            resume_data = store.resume_state()
++            if resume_data and resume_data.get("instrument_name") == self.plan.instrument_name:
++                pages_fetched = resume_data.get("pages_fetched", 0)
++                total_bytes_fetched = resume_data.get("total_bytes", 0)
++                if self.plan.sorting == "asc":
++                    current_start = resume_data.get("next_start_timestamp", current_start)
++                else:
++                    current_end = resume_data.get("next_end_timestamp", current_end)
++
++                # Restore previous trades from store
++                for _, page_bytes in store.query("trade_page_"):
++                    page_items = json.loads(page_bytes.decode("utf-8"))
++                    for t in page_items:
++                        seq = int(t.get("trade_seq", 0)) if t.get("trade_seq") is not None else 0
++                        tid = str(t.get("trade_id", ""))
++                        key = (seq, tid)
++                        if key not in seen_keys:
++                            seen_keys.add(key)
++                            collected_trades.append(t)
++
++        while True:
++            # Check budgets before making next request
++            if pages_fetched >= self.plan.max_pages:
++                is_complete = False
++                status = "INCOMPLETE"
++                reason_code = "page_cap_reached"
++                break
++
++            if self.plan.max_bytes is not None and total_bytes_fetched >= self.plan.max_bytes:
++                is_complete = False
++                status = "INCOMPLETE"
++                reason_code = "byte_cap_reached"
++                break
++
++            elapsed = time.monotonic() - start_wall_time
++            if self.plan.max_seconds is not None and elapsed >= self.plan.max_seconds:
++                is_complete = False
++                status = "INCOMPLETE"
++                reason_code = "time_budget_exceeded"
++                break
++
++            # Build request params
++            params: dict[str, Any] = {
++                "instrument_name": self.plan.instrument_name,
++                "start_timestamp": current_start,
++                "end_timestamp": current_end,
++                "count": self.plan.count,
++                "sorting": self.plan.sorting,
++            }
++
++            try:
++                result, byte_size = fetch_deribit_json(
++                    self.plan.base_url,
++                    "/get_last_trades_by_instrument_and_time",
++                    params,
++                    timeout=self.plan.timeout_seconds,
++                    max_retries=self.plan.max_retries,
++                    sleeper=sleeper,
++                )
++            except DeribitHistoryError as exc:
++                is_complete = False
++                status = "FAILED"
++                reason_code = f"fetch_error: {exc}"
++                break
++
++            pages_fetched += 1
++            total_bytes_fetched += byte_size
++
++            trades = result.get("trades", [])
++            has_more = bool(result.get("has_more"))
++
++            if not trades:
++                # No trades found in this window
++                if not collected_trades:
++                    status = "EMPTY"
++                    reason_code = "no_trades_found"
++                break
++
++            # Filter and deduplicate trades in page
++            new_trades: list[dict[str, Any]] = []
++            for t in trades:
++                seq = int(t.get("trade_seq", 0)) if t.get("trade_seq") is not None else 0
++                tid = str(t.get("trade_id", ""))
++                key = (seq, tid)
++                if key not in seen_keys:
++                    seen_keys.add(key)
++                    new_trades.append(t)
++                    collected_trades.append(t)
++
++            # Persist page to store if enabled
++            if store is not None and new_trades:
++                store.put(f"trade_page_{pages_fetched:06d}", json.dumps(new_trades).encode("utf-8"))
++
++            timestamps = [int(t["timestamp"]) for t in trades if "timestamp" in t]
++            if not timestamps:
++                break
++
++            min_ts = min(timestamps)
++            max_ts = max(timestamps)
++
++            # Check if there are more trades to fetch
++            if not has_more:
++                # We have reached the end of Deribit's available trades
++                break
++
++            # Check for Same-Millisecond Overflow condition:
++            # All trades returned in this full page have the EXACT same millisecond AND hit the page count limit.
++            if len(trades) >= self.plan.count and min_ts == max_ts:
++                if self.plan.enable_sequence_continuation:
++                    # Attempt sequence continuation across this saturated millisecond
++                    seqs = [int(t["trade_seq"]) for t in trades if "trade_seq" in t and t["trade_seq"] is not None]
++                    if seqs:
++                        last_seq = max(seqs) if self.plan.sorting == "asc" else min(seqs)
++                        seq_advanced = self._continue_via_sequence(
++                            last_seq=last_seq,
++                            target_timestamp=max_ts,
++                            seen_keys=seen_keys,
++                            collected_trades=collected_trades,
++                            sleeper=sleeper,
++                        )
++                        if seq_advanced is not None:
++                            # Successfully bridged past the saturated millisecond!
++                            if self.plan.sorting == "asc":
++                                current_start = seq_advanced
++                            else:
++                                current_end = seq_advanced
++                            continue
++
++                # If sequence continuation cannot advance or is disabled:
++                # We cannot guarantee complete coverage for this millisecond!
++                is_complete = False
++                status = "INCOMPLETE"
++                reason_code = "same_millisecond_overflow"
++                break
++
++            # Boundary Inclusive Pagination:
++            # If all trades at max_ts fit into the page (len(trades) < count and min_ts == max_ts),
++            # we can advance past max_ts without skipping.
++            if min_ts == max_ts and len(trades) < self.plan.count:
++                if self.plan.sorting == "asc":
++                    current_start = max_ts + 1
++                    if current_start > self.plan.end_timestamp:
++                        break
++                else:
++                    current_end = min_ts - 1
++                    if current_end < self.plan.start_timestamp:
++                        break
++            else:
++                # Overlap the boundary timestamp to prevent losing trades in the same millisecond!
++                if self.plan.sorting == "asc":
++                    current_start = max_ts  # Inclusive boundary forward
++                    if current_start > self.plan.end_timestamp:
++                        break
++                else:
++                    current_end = min_ts  # Inclusive boundary backward
++                    if current_end < self.plan.start_timestamp:
++                        break
++
++            # Persist resume cursor
++            if store is not None:
++                cursor = {
++                    "instrument_name": self.plan.instrument_name,
++                    "pages_fetched": pages_fetched,
++                    "total_bytes": total_bytes_fetched,
++                    "next_start_timestamp": current_start,
++                    "next_end_timestamp": current_end,
++                    "collected_count": len(collected_trades),
++                }
++                store.put("resume_cursor", json.dumps(cursor).encode("utf-8"))
++
++        # Finalize and sort trades
++        sorted_unique_trades = sort_trades(collected_trades)
++        gap_analysis = analyze_sequence_gaps(sorted_unique_trades)
++
++        # Canonical SHA256
++        canonical_bytes = json.dumps(
++            [trade_identity_key(t) for t in sorted_unique_trades],
++            separators=(",", ":"),
++        ).encode("utf-8")
++        trades_sha256 = hashlib.sha256(canonical_bytes).hexdigest()
++
++        actual_start = sorted_unique_trades[0]["timestamp"] if sorted_unique_trades else None
++        actual_end = sorted_unique_trades[-1]["timestamp"] if sorted_unique_trades else None
++
++        elapsed_seconds = time.monotonic() - start_wall_time
++
++        manifest = CompletenessManifest(
++            schema_version=SCHEMA_VERSION,
++            instrument_name=self.plan.instrument_name,
++            requested_start_ms=self.plan.start_timestamp,
++            requested_end_ms=self.plan.end_timestamp,
++            actual_start_ms=actual_start,
++            actual_end_ms=actual_end,
++            is_complete=is_complete,
++            status=status,
++            reason_code=reason_code,
++            total_trades_received=len(collected_trades),
++            unique_trades_count=len(sorted_unique_trades),
++            pages_fetched=pages_fetched,
++            total_bytes_fetched=total_bytes_fetched,
++            elapsed_seconds=elapsed_seconds,
++            sequence_gaps_analysis=gap_analysis,
++            trades_sha256=trades_sha256,
++            resume_cursor={
++                "next_start_timestamp": current_start,
++                "next_end_timestamp": current_end,
++                "pages_fetched": pages_fetched,
++            } if not is_complete else None,
++        )
++
++        return sorted_unique_trades, manifest
++
++    def _continue_via_sequence(
++        self,
++        last_seq: int,
++        target_timestamp: int,
++        seen_keys: set[tuple[int, str]],
++        collected_trades: list[dict[str, Any]],
++        sleeper: Callable[[float], None],
++    ) -> int | None:
++        """Fetch trades via sequence endpoint when a single millisecond overflows page count."""
++        start_seq = last_seq + 1 if self.plan.sorting == "asc" else max(1, last_seq - self.plan.count)
++        end_seq = start_seq + self.plan.count - 1 if self.plan.sorting == "asc" else last_seq - 1
++
++        params: dict[str, Any] = {
++            "instrument_name": self.plan.instrument_name,
++            "start_seq": start_seq,
++            "end_seq": end_seq,
++            "count": self.plan.count,
++            "sorting": self.plan.sorting,
++        }
++
++        try:
++            result, _ = fetch_deribit_json(
++                self.plan.base_url,
++                "/get_last_trades_by_instrument",
++                params,
++                timeout=self.plan.timeout_seconds,
++                max_retries=self.plan.max_retries,
++                sleeper=sleeper,
++            )
++        except DeribitHistoryError:
++            return None
++
++        trades = result.get("trades", [])
++        if not trades:
++            return None
++
++        advanced_ts: int | None = None
++        for t in trades:
++            seq = int(t.get("trade_seq", 0)) if t.get("trade_seq") is not None else 0
++            tid = str(t.get("trade_id", ""))
++            key = (seq, tid)
++            if key not in seen_keys:
++                seen_keys.add(key)
++                collected_trades.append(t)
++            t_ms = int(t.get("timestamp", 0))
++            if self.plan.sorting == "asc" and t_ms > target_timestamp:
++                advanced_ts = t_ms
++            elif self.plan.sorting == "desc" and t_ms < target_timestamp:
++                advanced_ts = t_ms
++
++        return advanced_ts
++
++
++# ==============================================================================
++# 6. HistoricalTradeProvider Implementation
++# ==============================================================================
++
++class DeribitHistoricalTradeProvider:
++    """Historical trade provider conforming to core.contracts.HistoricalTradeProvider."""
++
++    def __init__(self, base_url: str = DEFAULT_BASE_URL) -> None:
++        self.base_url = base_url
++
++    def fetch(self, plan: Any) -> DownloadResult:
++        """Fetch historical trades for the given plan and return DownloadResult."""
++        if not isinstance(plan, HistoryDownloadPlan):
++            raise ValidationError("plan must be an instance of HistoryDownloadPlan")
++
++        downloader = LosslessHistoryDownloader(plan)
++        trades, manifest = downloader.download()
++
++        return DownloadResult(
++            success=manifest.is_complete,
++            ticks_count=manifest.unique_trades_count,
++            start_ms=self.convert_to_ms(manifest.actual_start_ms or plan.start_timestamp),
++            end_ms=self.convert_to_ms(manifest.actual_end_ms or plan.end_timestamp),
++            output_path=None,
++            error_message=None if manifest.is_complete else manifest.reason_code,
++        )
++
++    @staticmethod
++    def convert_to_ms(val: int) -> int:
++        return int(val)
++
++    @staticmethod
++    def to_trade_ticks(trades: Sequence[dict[str, Any]]) -> list[TradeTick]:
++        """Convert raw Deribit trades into immutable TradeTick contracts with Decimals."""
++        ticks: list[TradeTick] = []
++        for t in sort_trades(trades):
++            ticks.append(
++                TradeTick(
++                    instrument_name=str(t.get("instrument_name", "")),
++                    trade_id=str(t.get("trade_id", "")),
++                    trade_seq=int(t.get("trade_seq", 0)),
++                    timestamp_ms=int(t.get("timestamp", 0)),
++                    price_btc=Decimal(str(t.get("price", "0"))),
++                    quantity_contracts=Decimal(str(t.get("amount", "0"))),
++                    source_ref=f"deribit_history_{t.get('trade_id', '')}",
++                )
++            )
++        return ticks
++
++
++# ==============================================================================
++# 7. Smoke Check Runner (Max 20 Requests)
++# ==============================================================================
++
++def run_live_smoke_check(
++    instrument_name: str,
++    start_timestamp: int,
++    end_timestamp: int,
++    *,
++    max_requests: int = MAX_SMOKE_REQUESTS,
++    base_url: str = DEFAULT_BASE_URL,
++) -> dict[str, Any]:
++    """Execute a live smoke check strictly capped at max 20 requests."""
++    capped_requests = min(max_requests, MAX_SMOKE_REQUESTS)
++    plan = HistoryDownloadPlan(
++        instrument_name=instrument_name,
++        start_timestamp=start_timestamp,
++        end_timestamp=end_timestamp,
++        count=min(DEFAULT_COUNT, 100),
++        max_pages=capped_requests,
++        base_url=base_url,
++    )
++    downloader = LosslessHistoryDownloader(plan)
++    trades, manifest = downloader.download()
++    return {
++        "manifest": manifest.to_dict(),
++        "trade_sample_count": len(trades),
++        "requests_executed": manifest.pages_fetched,
++        "capped_max_requests": capped_requests,
++    }
+diff --git a/tests/test_deribit_history.py b/tests/test_deribit_history.py
+index d6b100e..41004db 100644
+--- a/tests/test_deribit_history.py
++++ b/tests/test_deribit_history.py
+@@ -1,14 +1,18 @@
++import io
+ import json
+ import unittest
+-from unittest.mock import patch
++from unittest.mock import MagicMock, patch
++from urllib.error import HTTPError, URLError
+ 
+ from ingestion.deribit_history import (
+     DEFAULT_BASE_URL,
+     DEFAULT_COUNT,
+     MAX_COUNT,
+     DeribitHistoryError,
++    TradeDownloadPlan,
+     build_sequence_plan,
+     build_time_plan,
++    fetch_deribit_json,
+     fetch_trade_pages,
+     planned_requests,
+     summarize_download,
+@@ -16,8 +20,9 @@ from ingestion.deribit_history import (
+ 
+ 
+ class FakeResponse:
+-    def __init__(self, payload):
++    def __init__(self, payload, byte_content: bytes | None = None):
+         self.payload = payload
++        self.byte_content = byte_content
+ 
+     def __enter__(self):
+         return self
+@@ -26,6 +31,8 @@ class FakeResponse:
+         return False
+ 
+     def read(self):
++        if self.byte_content is not None:
++            return self.byte_content
+         return json.dumps(self.payload).encode("utf-8")
+ 
+ 
+@@ -142,6 +149,135 @@ class DeribitHistoryTests(unittest.TestCase):
+         with self.assertRaisesRegex(ValueError, "count must be <= 1000"):
+             build_sequence_plan("BTC-TEST", 1, 1001, count=1001)
+ 
++    # --------------------------------------------------------------------------
++    # Additional Resiliency, Timeout, 429, and Budget Tests
++    # --------------------------------------------------------------------------
++
++    def test_http_429_retry_after_respected(self):
++        """HTTP 429 with Retry-After header backs off and succeeds on retry."""
++        err_429 = HTTPError(
++            url="http://test",
++            code=429,
++            msg="Too Many Requests",
++            hdrs={"Retry-After": "3.5"},
++            fp=None,
++        )
++        success = FakeResponse({"result": {"trades": [{"trade_seq": 1}], "has_more": False}})
++        sleep_calls = []
++
++        try:
++            with patch("ingestion.deribit_history.urlopen", side_effect=[err_429, success]):
++                result, byte_size = fetch_deribit_json(
++                    DEFAULT_BASE_URL,
++                    "/get_last_trades_by_instrument",
++                    {"instrument_name": "BTC-TEST"},
++                    max_retries=3,
++                    sleeper=lambda s: sleep_calls.append(s),
++                )
++        finally:
++            err_429.close()
++
++        self.assertEqual(len(sleep_calls), 1)
++        self.assertEqual(sleep_calls[0], 3.5)
++        self.assertEqual(len(result["trades"]), 1)
++
++    def test_retry_exhaustion_raises_deribit_history_error(self):
++        """When retries are exhausted after max_retries attempts, raises DeribitHistoryError."""
++        err = URLError("Temporary connection failure")
++        sleep_calls = []
++
++        with patch("ingestion.deribit_history.urlopen", side_effect=err):
++            with self.assertRaisesRegex(DeribitHistoryError, "after 3 retries"):
++                fetch_deribit_json(
++                    DEFAULT_BASE_URL,
++                    "/get_last_trades_by_instrument",
++                    {"instrument_name": "BTC-TEST"},
++                    max_retries=3,
++                    sleeper=lambda s: sleep_calls.append(s),
++                )
++
++        self.assertEqual(len(sleep_calls), 2)  # Slept before attempt 2 and attempt 3
++
++    def test_server_error_500_retries_with_exponential_backoff(self):
++        """HTTP 500 server error retries with exponential backoff and succeeds."""
++        err_500_1 = HTTPError(url="http://test", code=500, msg="Internal Server Error", hdrs={}, fp=None)
++        err_500_2 = HTTPError(url="http://test", code=500, msg="Internal Server Error", hdrs={}, fp=None)
++        success = FakeResponse({"result": {"trades": [{"trade_seq": 42}], "has_more": False}})
++        sleep_calls = []
++
++        try:
++            with patch("ingestion.deribit_history.urlopen", side_effect=[err_500_1, err_500_2, success]):
++                result, _ = fetch_deribit_json(
++                    DEFAULT_BASE_URL,
++                    "/get_last_trades_by_instrument",
++                    {"instrument_name": "BTC-TEST"},
++                    max_retries=5,
++                    backoff_factor=1.0,
++                    sleeper=lambda s: sleep_calls.append(s),
++                )
++        finally:
++            err_500_1.close()
++            err_500_2.close()
++
++        self.assertEqual(len(sleep_calls), 2)
++        self.assertEqual(sleep_calls[0], 1.0)  # 1.0 * (2^0)
++        self.assertEqual(sleep_calls[1], 2.0)  # 1.0 * (2^1)
++        self.assertEqual(result["trades"][0]["trade_seq"], 42)
++
++    def test_http_400_is_non_retryable(self):
++        """HTTP 400 Bad Request immediately fails without wasting retries."""
++        err_400 = HTTPError(
++            url="http://test",
++            code=400,
++            msg="Bad Request",
++            hdrs={},
++            fp=None,
++        )
++        sleep_calls = []
++
++        try:
++            with patch("ingestion.deribit_history.urlopen", side_effect=err_400):
++                with self.assertRaisesRegex(DeribitHistoryError, "HTTP 400"):
++                    fetch_deribit_json(
++                        DEFAULT_BASE_URL,
++                        "/get_last_trades_by_instrument",
++                        {"instrument_name": "BTC-TEST"},
++                        max_retries=5,
++                        sleeper=lambda s: sleep_calls.append(s),
++                    )
++        finally:
++            err_400.close()
++
++        self.assertEqual(len(sleep_calls), 0)  # Zero retries attempted
++
++    def test_budget_cap_max_bytes(self):
++        """fetch_trade_pages respects max_bytes limit."""
++        plan = build_sequence_plan("BTC-TEST", 1, 100, count=10, max_pages=10, max_bytes=50)
++        # Each page response has byte size ~ 80 bytes
++        payload = {"result": {"trades": [{"trade_seq": i} for i in range(10)], "has_more": True}}
++
++        with patch("ingestion.deribit_history.urlopen", return_value=FakeResponse(payload)):
++            pages = fetch_trade_pages(plan)
++
++        # After page 1, total_bytes >= 50, so page 2 is not fetched!
++        self.assertEqual(len(pages), 1)
++
++    def test_budget_cap_max_seconds(self):
++        """fetch_trade_pages respects max_seconds limit."""
++        plan = build_sequence_plan("BTC-TEST", 1, 100, count=10, max_pages=10, max_seconds=0.001)
++        payload = {"result": {"trades": [{"trade_seq": 1}], "has_more": True}}
++
++        def slow_urlopen(*args, **kwargs):
++            import time
++            time.sleep(0.005)
++            return FakeResponse(payload)
++
++        with patch("ingestion.deribit_history.urlopen", side_effect=slow_urlopen):
++            pages = fetch_trade_pages(plan)
++
++        # Due to max_seconds=0.001, only 1 page fetched before time budget expires
++        self.assertEqual(len(pages), 1)
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/tests/test_history_download.py b/tests/test_history_download.py
+new file mode 100644
+index 0000000..f3a2563
+--- /dev/null
++++ b/tests/test_history_download.py
+@@ -0,0 +1,494 @@
++"""Comprehensive acceptance tests for lossless and resumable historical trade download.
++
++Covers all Task 4 requirements:
++  - Tek ms'de count Ã¼stÃ¼ trade (Same millisecond count overflow & sequence continuation)
++  - Reverse/unordered rows (Deterministic sorting by timestamp, trade_seq, trade_id)
++  - Tekrar sayfa / Overlap deduplication
++  - Kesilen baÄŸlantÄ± (Interrupted connection & recovery)
++  - Retry exhaustion (Clean failure reporting)
++  - Page-cap, max_bytes, max_seconds boundaries (INCOMPLETE manifests)
++  - Boundary inclusive fixtures
++  - Resume + dedup identical to uninterrupted reference
++  - Sequence gap analysis without biased loss labeling
++  - Store protocol implementations (InMemoryStore & JsonFileStore)
++  - HistoricalTradeProvider & TradeTick conversion
++  - Smoke check cap (azami 20 request)
++"""
++
++import json
++import tempfile
++import time
++import unittest
++from decimal import Decimal
++from pathlib import Path
++from unittest.mock import MagicMock, patch
++from urllib.error import URLError
++
++from core.contracts import HistoricalTradeProvider, Store, TradeTick
++from ingestion.history_download import (
++    CompletenessManifest,
++    DeribitHistoricalTradeProvider,
++    HistoryDownloadPlan,
++    InMemoryStore,
++    JsonFileStore,
++    LosslessHistoryDownloader,
++    analyze_sequence_gaps,
++    deduplicate_trades,
++    run_live_smoke_check,
++    sort_trades,
++)
++
++
++class FakeResponse:
++    def __init__(self, payload):
++        self.payload = payload
++
++    def __enter__(self):
++        return self
++
++    def __exit__(self, exc_type, exc, traceback):
++        return False
++
++    def read(self):
++        return json.dumps(self.payload).encode("utf-8")
++
++
++class HistoryDownloadTests(unittest.TestCase):
++    # --------------------------------------------------------------------------
++    # 1. Single Millisecond Count Overflow & Sequence Continuation
++    # --------------------------------------------------------------------------
++
++    def test_single_millisecond_count_overflow_with_sequence_continuation(self):
++        """When more trades than count occur in the same millisecond, sequence continuation bridges across."""
++        # 8 trades at ts 1,000,000. Count=5.
++        # Time page 1 returns 5 trades (seq 1..5) at ts 1,000,000 with has_more=True.
++        time_page_1 = {
++            "result": {
++                "trades": [
++                    {"instrument_name": "BTC-TEST", "trade_seq": i, "trade_id": f"T{i}", "timestamp": 1000000, "price": 0.05, "amount": 1.0}
++                    for i in range(1, 6)
++                ],
++                "has_more": True,
++            }
++        }
++        # Sequence continuation returns remaining trades (seq 6..8) at ts 1,000,000 + next trade at ts 1,001,000
++        seq_page = {
++            "result": {
++                "trades": [
++                    {"instrument_name": "BTC-TEST", "trade_seq": 6, "trade_id": "T6", "timestamp": 1000000, "price": 0.05, "amount": 1.0},
++                    {"instrument_name": "BTC-TEST", "trade_seq": 7, "trade_id": "T7", "timestamp": 1000000, "price": 0.05, "amount": 1.0},
++                    {"instrument_name": "BTC-TEST", "trade_seq": 8, "trade_id": "T8", "timestamp": 1000000, "price": 0.05, "amount": 1.0},
++                    {"instrument_name": "BTC-TEST", "trade_seq": 9, "trade_id": "T9", "timestamp": 1001000, "price": 0.05, "amount": 1.0},
++                ],
++                "has_more": False,
++            }
++        }
++        # Subsequent time page from 1,001,000 returns no more trades
++        time_page_2 = {
++            "result": {
++                "trades": [
++                    {"instrument_name": "BTC-TEST", "trade_seq": 9, "trade_id": "T9", "timestamp": 1001000, "price": 0.05, "amount": 1.0},
++                ],
++                "has_more": False,
++            }
++        }
++
++        plan = HistoryDownloadPlan(
++            instrument_name="BTC-TEST",
++            start_timestamp=1000000,
++            end_timestamp=1002000,
++            count=5,
++            enable_sequence_continuation=True,
++        )
++        downloader = LosslessHistoryDownloader(plan)
++
++        with patch("ingestion.deribit_history.urlopen", side_effect=[
++            FakeResponse(time_page_1),
++            FakeResponse(seq_page),
++            FakeResponse(time_page_2),
++        ]):
++            trades, manifest = downloader.download()
++
++        self.assertTrue(manifest.is_complete)
++        self.assertEqual(manifest.status, "COMPLETE")
++        self.assertEqual(len(trades), 9)
++        self.assertEqual([t["trade_seq"] for t in trades], list(range(1, 10)))
++
++    def test_single_millisecond_overflow_without_sequence_continuation_marks_incomplete(self):
++        """When sequence continuation is disabled and same-ms overflows, manifest marks INCOMPLETE."""
++        time_page = {
++            "result": {
++                "trades": [
++                    {"instrument_name": "BTC-TEST", "trade_seq": i, "trade_id": f"T{i}", "timestamp": 1000000, "price": 0.05, "amount": 1.0}
++                    for i in range(1, 6)
++                ],
++                "has_more": True,
++            }
++        }
++
++        plan = HistoryDownloadPlan(
++            instrument_name="BTC-TEST",
++            start_timestamp=1000000,
++            end_timestamp=1002000,
++            count=5,
++            enable_sequence_continuation=False,
++        )
++        downloader = LosslessHistoryDownloader(plan)
++
++        with patch("ingestion.deribit_history.urlopen", return_value=FakeResponse(time_page)):
++            trades, manifest = downloader.download()
++
++        self.assertFalse(manifest.is_complete)
++        self.assertEqual(manifest.status, "INCOMPLETE")
++        self.assertEqual(manifest.reason_code, "same_millisecond_overflow")
++        self.assertEqual(len(trades), 5)
++
++    # --------------------------------------------------------------------------
++    # 2. Reverse and Unordered Rows
++    # --------------------------------------------------------------------------
++
++    def test_reverse_and_unordered_rows_are_stably_sorted(self):
++        """Incoming trades in arbitrary or reversed order are sorted deterministically."""
++        scrambled = [
++            {"instrument_name": "BTC-TEST", "trade_seq": 5, "trade_id": "E", "timestamp": 3000},
++            {"instrument_name": "BTC-TEST", "trade_seq": 1, "trade_id": "A", "timestamp": 1000},
++            {"instrument_name": "BTC-TEST", "trade_seq": 4, "trade_id": "D", "timestamp": 2500},
++            {"instrument_name": "BTC-TEST", "trade_seq": 2, "trade_id": "B", "timestamp": 1000},
++            {"instrument_name": "BTC-TEST", "trade_seq": 3, "trade_id": "C", "timestamp": 2000},
++        ]
++        sorted_res = sort_trades(scrambled)
++        expected_seqs = [1, 2, 3, 4, 5]
++        self.assertEqual([t["trade_seq"] for t in sorted_res], expected_seqs)
++
++    # --------------------------------------------------------------------------
++    # 3. Repeated Page / Overlap Deduplication
++    # --------------------------------------------------------------------------
++
++    def test_repeated_page_boundary_inclusive_and_overlap_deduplication(self):
++        """Boundary inclusive time queries repeat trades on the boundary; dedup removes them perfectly."""
++        # Page 1 ends at ts 2000 with trades 1, 2, 3
++        page_1 = {
++            "result": {
++                "trades": [
++                    {"instrument_name": "BTC-TEST", "trade_seq": 1, "trade_id": "T1", "timestamp": 1000},
++                    {"instrument_name": "BTC-TEST", "trade_seq": 2, "trade_id": "T2", "timestamp": 2000},
++                    {"instrument_name": "BTC-TEST", "trade_seq": 3, "trade_id": "T3", "timestamp": 2000},
++                ],
++                "has_more": True,
++            }
++        }
++        # Page 2 starts at ts 2000 (inclusive) and returns trades 2, 3, 4
++        page_2 = {
++            "result": {
++                "trades": [
++                    {"instrument_name": "BTC-TEST", "trade_seq": 2, "trade_id": "T2", "timestamp": 2000},
++                    {"instrument_name": "BTC-TEST", "trade_seq": 3, "trade_id": "T3", "timestamp": 2000},
++                    {"instrument_name": "BTC-TEST", "trade_seq": 4, "trade_id": "T4", "timestamp": 3000},
++                ],
++                "has_more": False,
++            }
++        }
++
++        plan = HistoryDownloadPlan("BTC-TEST", 1000, 3000, count=3)
++        downloader = LosslessHistoryDownloader(plan)
++
++        with patch("ingestion.deribit_history.urlopen", side_effect=[FakeResponse(page_1), FakeResponse(page_2)]):
++            trades, manifest = downloader.download()
++
++        self.assertTrue(manifest.is_complete)
++        self.assertEqual(len(trades), 4)
++        self.assertEqual([t["trade_seq"] for t in trades], [1, 2, 3, 4])
++        self.assertEqual(manifest.unique_trades_count, 4)
++
++    # --------------------------------------------------------------------------
++    # 4. Broken Connection & Recovery
++    # --------------------------------------------------------------------------
++
++    def test_broken_connection_retries_and_recovers(self):
++        """Interrupted connection retries up to max_retries and recovers seamlessly."""
++        success_payload = {
++            "result": {
++                "trades": [{"instrument_name": "BTC-TEST", "trade_seq": 1, "trade_id": "T1", "timestamp": 1000}],
++                "has_more": False,
++            }
++        }
++        err_1 = URLError("Connection reset by peer")
++        err_2 = TimeoutError("Read timed out")
++        success = FakeResponse(success_payload)
++
++        plan = HistoryDownloadPlan("BTC-TEST", 1000, 2000, max_retries=5)
++        downloader = LosslessHistoryDownloader(plan)
++
++        with patch("ingestion.deribit_history.urlopen", side_effect=[err_1, err_2, success]):
++            trades, manifest = downloader.download(sleeper=lambda s: None)
++
++        self.assertTrue(manifest.is_complete)
++        self.assertEqual(manifest.status, "COMPLETE")
++        self.assertEqual(len(trades), 1)
++
++    # --------------------------------------------------------------------------
++    # 5. Retry Exhaustion
++    # --------------------------------------------------------------------------
++
++    def test_retry_exhaustion_marks_failure_in_manifest(self):
++        """When retries are exhausted, manifest documents FAILED status and error reason."""
++        plan = HistoryDownloadPlan("BTC-TEST", 1000, 2000, max_retries=3)
++        downloader = LosslessHistoryDownloader(plan)
++
++        with patch("ingestion.deribit_history.urlopen", side_effect=URLError("Network down")):
++            trades, manifest = downloader.download(sleeper=lambda s: None)
++
++        self.assertFalse(manifest.is_complete)
++        self.assertEqual(manifest.status, "FAILED")
++        self.assertIn("fetch_error", manifest.reason_code)
++
++    # --------------------------------------------------------------------------
++    # 6. Budget Limits (Page-Cap, Max-Bytes, Max-Seconds)
++    # --------------------------------------------------------------------------
++
++    def test_page_cap_budget_marks_incomplete(self):
++        """Downloader stops when max_pages is reached, marking INCOMPLETE."""
++        page = {
++            "result": {
++                "trades": [{"instrument_name": "BTC-TEST", "trade_seq": 1, "trade_id": "T1", "timestamp": 1000}],
++                "has_more": True,
++            }
++        }
++        plan = HistoryDownloadPlan("BTC-TEST", 1000, 5000, max_pages=2)
++        downloader = LosslessHistoryDownloader(plan)
++
++        with patch("ingestion.deribit_history.urlopen", return_value=FakeResponse(page)):
++            trades, manifest = downloader.download()
++
++        self.assertFalse(manifest.is_complete)
++        self.assertEqual(manifest.status, "INCOMPLETE")
++        self.assertEqual(manifest.reason_code, "page_cap_reached")
++        self.assertEqual(manifest.pages_fetched, 2)
++
++    def test_max_bytes_budget_marks_incomplete(self):
++        """Downloader stops when max_bytes limit is reached, marking INCOMPLETE."""
++        page = {
++            "result": {
++                "trades": [{"instrument_name": "BTC-TEST", "trade_seq": 1, "trade_id": "T1", "timestamp": 1000}],
++                "has_more": True,
++            }
++        }
++        # Each FakeResponse serialized is ~120 bytes; max_bytes=80 will stop after 1 page
++        plan = HistoryDownloadPlan("BTC-TEST", 1000, 5000, max_pages=10, max_bytes=80)
++        downloader = LosslessHistoryDownloader(plan)
++
++        with patch("ingestion.deribit_history.urlopen", return_value=FakeResponse(page)):
++            trades, manifest = downloader.download()
++
++        self.assertFalse(manifest.is_complete)
++        self.assertEqual(manifest.status, "INCOMPLETE")
++        self.assertEqual(manifest.reason_code, "byte_cap_reached")
++        self.assertEqual(manifest.pages_fetched, 1)
++
++    def test_max_seconds_budget_marks_incomplete(self):
++        """Downloader stops when wall-clock duration exceeds max_seconds."""
++        page = {
++            "result": {
++                "trades": [{"instrument_name": "BTC-TEST", "trade_seq": 1, "trade_id": "T1", "timestamp": 1000}],
++                "has_more": True,
++            }
++        }
++        plan = HistoryDownloadPlan("BTC-TEST", 1000, 5000, max_pages=10, max_seconds=0.001)
++        downloader = LosslessHistoryDownloader(plan)
++
++        def slow_urlopen(*args, **kwargs):
++            time.sleep(0.005)
++            return FakeResponse(page)
++
++        with patch("ingestion.deribit_history.urlopen", side_effect=slow_urlopen):
++            trades, manifest = downloader.download()
++
++        self.assertFalse(manifest.is_complete)
++        self.assertEqual(manifest.status, "INCOMPLETE")
++        self.assertEqual(manifest.reason_code, "time_budget_exceeded")
++
++    # --------------------------------------------------------------------------
++    # 7. Boundary Inclusive Fixtures
++    # --------------------------------------------------------------------------
++
++    def test_boundary_inclusive_fixtures(self):
++        """Trades on exact start_timestamp and end_timestamp are both captured."""
++        page = {
++            "result": {
++                "trades": [
++                    {"instrument_name": "BTC-TEST", "trade_seq": 1, "trade_id": "T1", "timestamp": 1000},
++                    {"instrument_name": "BTC-TEST", "trade_seq": 2, "trade_id": "T2", "timestamp": 5000},
++                ],
++                "has_more": False,
++            }
++        }
++        plan = HistoryDownloadPlan("BTC-TEST", 1000, 5000)
++        downloader = LosslessHistoryDownloader(plan)
++
++        with patch("ingestion.deribit_history.urlopen", return_value=FakeResponse(page)):
++            trades, manifest = downloader.download()
++
++        self.assertEqual(trades[0]["timestamp"], 1000)
++        self.assertEqual(trades[-1]["timestamp"], 5000)
++        self.assertEqual(manifest.actual_start_ms, 1000)
++        self.assertEqual(manifest.actual_end_ms, 5000)
++
++    # --------------------------------------------------------------------------
++    # 8. Resume + Dedup Equals Uninterrupted Reference
++    # --------------------------------------------------------------------------
++
++    def test_resume_plus_dedup_produces_identical_result_to_uninterrupted_reference(self):
++        """Interrupted run resumed from Store produces identical result to uninterrupted run."""
++        pages = [
++            {
++                "result": {
++                    "trades": [
++                        {"instrument_name": "BTC-TEST", "trade_seq": 1, "trade_id": "T1", "timestamp": 1000},
++                        {"instrument_name": "BTC-TEST", "trade_seq": 2, "trade_id": "T2", "timestamp": 2000},
++                    ],
++                    "has_more": True,
++                }
++            },
++            {
++                "result": {
++                    "trades": [
++                        {"instrument_name": "BTC-TEST", "trade_seq": 2, "trade_id": "T2", "timestamp": 2000},
++                        {"instrument_name": "BTC-TEST", "trade_seq": 3, "trade_id": "T3", "timestamp": 3000},
++                    ],
++                    "has_more": True,
++                }
++            },
++            {
++                "result": {
++                    "trades": [
++                        {"instrument_name": "BTC-TEST", "trade_seq": 3, "trade_id": "T3", "timestamp": 3000},
++                        {"instrument_name": "BTC-TEST", "trade_seq": 4, "trade_id": "T4", "timestamp": 4000},
++                    ],
++                    "has_more": False,
++                }
++            },
++        ]
++
++        # 1. Uninterrupted run
++        plan_ref = HistoryDownloadPlan("BTC-TEST", 1000, 4000, count=2, max_pages=10)
++        ref_downloader = LosslessHistoryDownloader(plan_ref)
++        with patch("ingestion.deribit_history.urlopen", side_effect=[
++            FakeResponse(pages[0]),
++            FakeResponse(pages[1]),
++            FakeResponse(pages[2]),
++        ]):
++            ref_trades, ref_manifest = ref_downloader.download()
++
++        # 2. Resumed run (batch 1 fetches page 1, batch 2 resumes to fetch pages 2 and 3)
++        store = InMemoryStore()
++        plan_part1 = HistoryDownloadPlan("BTC-TEST", 1000, 4000, count=2, max_pages=1)
++        part1_downloader = LosslessHistoryDownloader(plan_part1)
++        with patch("ingestion.deribit_history.urlopen", side_effect=[FakeResponse(pages[0])]):
++            part1_trades, part1_manifest = part1_downloader.download(store=store)
++
++        self.assertFalse(part1_manifest.is_complete)
++        self.assertIsNotNone(store.get("resume_cursor"))
++
++        plan_part2 = HistoryDownloadPlan("BTC-TEST", 1000, 4000, count=2, max_pages=10)
++        part2_downloader = LosslessHistoryDownloader(plan_part2)
++        with patch("ingestion.deribit_history.urlopen", side_effect=[
++            FakeResponse(pages[1]),
++            FakeResponse(pages[2]),
++        ]):
++            resumed_trades, resumed_manifest = part2_downloader.download(store=store, resume=True)
++
++        self.assertTrue(resumed_manifest.is_complete)
++        self.assertEqual(len(ref_trades), len(resumed_trades))
++        self.assertEqual([t["trade_seq"] for t in ref_trades], [t["trade_seq"] for t in resumed_trades])
++        self.assertEqual(ref_manifest.trades_sha256, resumed_manifest.trades_sha256)
++
++    # --------------------------------------------------------------------------
++    # 9. Sequence Gap Analysis
++    # --------------------------------------------------------------------------
++
++    def test_sequence_gap_analysis_tracks_diagnostics_without_false_accusation(self):
++        """Sequence gap analysis identifies missing numbers without blindly declaring data loss."""
++        trades = [
++            {"trade_seq": 10},
++            {"trade_seq": 11},
++            {"trade_seq": 15},
++            {"trade_seq": 16},
++            {"trade_seq": 20},
++        ]
++        res = analyze_sequence_gaps(trades)
++        self.assertEqual(res["min_seq"], 10)
++        self.assertEqual(res["max_seq"], 20)
++        self.assertEqual(res["unique_seq_count"], 5)
++        self.assertEqual(res["gap_count"], 6)
++        self.assertEqual(res["gaps"], [(12, 14), (17, 19)])
++        self.assertFalse(res["is_contiguous"])
++        self.assertIn("gaps_detected", res["interpretation"])
++        self.assertIn("exchange-level counter progression", res["interpretation"])
++
++    # --------------------------------------------------------------------------
++    # 10. Store Protocol Implementations
++    # --------------------------------------------------------------------------
++
++    def test_store_implementations_in_memory_and_json_file(self):
++        """Both InMemoryStore and JsonFileStore satisfy the Store protocol."""
++        stores = [InMemoryStore()]
++        with tempfile.TemporaryDirectory() as tmp:
++            stores.append(JsonFileStore(tmp))
++            for s in stores:
++                self.assertIsInstance(s, Store)
++                s.put("test_key", b"hello world")
++                self.assertEqual(s.get("test_key"), b"hello world")
++                self.assertIsNone(s.get("non_existent"))
++
++                # Query
++                s.put("item_1", b"val1")
++                s.put("item_2", b"val2")
++                queried = list(s.query("item_"))
++                self.assertEqual(len(queried), 2)
++
++                # Resume state
++                s.put("resume_cursor", json.dumps({"cursor": 123}).encode("utf-8"))
++                self.assertEqual(s.resume_state(), {"cursor": 123})
++
++    # --------------------------------------------------------------------------
++    # 11. HistoricalTradeProvider & TradeTick Conversion
++    # --------------------------------------------------------------------------
++
++    def test_historical_trade_provider_protocol_and_tradetick_conversion(self):
++        """DeribitHistoricalTradeProvider converts raw trades to immutable TradeTick contracts."""
++        provider = DeribitHistoricalTradeProvider()
++        self.assertIsInstance(provider, HistoricalTradeProvider)
++
++        raw_trades = [
++            {
++                "instrument_name": "BTC-27DEC24-100000-C",
++                "trade_id": "T101",
++                "trade_seq": 101,
++                "timestamp": 1700000000000,
++                "price": 0.045,
++                "amount": 2.5,
++            }
++        ]
++        ticks = provider.to_trade_ticks(raw_trades)
++        self.assertEqual(len(ticks), 1)
++        tick = ticks[0]
++        self.assertIsInstance(tick, TradeTick)
++        self.assertEqual(tick.instrument_name, "BTC-27DEC24-100000-C")
++        self.assertEqual(tick.price_btc, Decimal("0.045"))
++        self.assertEqual(tick.quantity_contracts, Decimal("2.5"))
++
++    # --------------------------------------------------------------------------
++    # 12. Smoke Check Cap (Azami 20 Requests)
++    # --------------------------------------------------------------------------
++
++    def test_smoke_check_capped_at_max_20_requests(self):
++        """run_live_smoke_check caps requests at max 20 even when called with higher value."""
++        empty_page = {"result": {"trades": [], "has_more": False}}
++        with patch("ingestion.deribit_history.urlopen", return_value=FakeResponse(empty_page)):
++            res = run_live_smoke_check("BTC-TEST", 1000, 2000, max_requests=100)
++
++        self.assertEqual(res["capped_max_requests"], 20)
++
++
++if __name__ == "__main__":
++    unittest.main()

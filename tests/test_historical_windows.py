@@ -2,17 +2,25 @@ import json
 import tempfile
 import unittest
 from datetime import UTC, datetime
+import math
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch
 
+from core.contracts import PriceBasis, PriceObservation
 from ingestion.historical_windows import (
+    DAY_MS,
     HOUR_MS,
     HistoricalWindow,
     HistoricalWindowError,
+    HourlyTradeBar,
     aggregate_hourly_trade_bars,
+    aggregate_trade_bars,
     build_default_windows,
     build_trade_plan_for_window,
+    clean_and_dedup_trades,
     fetch_hourly_trade_bars,
+    trade_bar_to_price_observation,
     utc_ms,
     write_window_bars_json,
 )
@@ -113,6 +121,106 @@ class HistoricalWindowsTests(unittest.TestCase):
             saved = json.loads(output.read_text(encoding="utf-8"))
 
         self.assertEqual(saved, payload)
+
+    def test_sequence_ordering_with_equal_timestamps_and_disordered_trades(self):
+        # Disordered trades arriving with both different timestamps and same timestamp with different sequence numbers
+        start = utc_ms(datetime(2026, 9, 9, 1, 0, tzinfo=UTC))
+        raw_trades = [
+            {"instrument_name": "BTC-TEST-C", "timestamp": start + 500, "trade_seq": 3, "price": 0.013, "amount": 1},
+            {"instrument_name": "BTC-TEST-C", "timestamp": start + 100, "trade_seq": 1, "price": 0.010, "amount": 2},
+            {"instrument_name": "BTC-TEST-C", "timestamp": start + 500, "trade_seq": 2, "price": 0.012, "amount": 1},
+        ]
+        bars = aggregate_hourly_trade_bars(raw_trades, instrument_name="BTC-TEST-C")
+        self.assertEqual(len(bars), 1)
+        bar = bars[0]
+        # Open should be trade with timestamp start+100 (price 0.010)
+        self.assertEqual(bar.open, 0.010)
+        # Close should be trade with timestamp start+500, trade_seq=3 (price 0.013)
+        self.assertEqual(bar.close, 0.013)
+        self.assertEqual(bar.first_trade_at, start + 100)
+        self.assertEqual(bar.last_trade_at, start + 500)
+        self.assertEqual(bar.available_at, start + HOUR_MS)
+
+    def test_deduplication_by_trade_id_preserves_volume_accuracy(self):
+        start = utc_ms(datetime(2026, 9, 9, 1, 0, tzinfo=UTC))
+        raw_trades = [
+            {"instrument_name": "BTC-TEST-C", "timestamp": start + 100, "trade_id": "T1", "price": 0.010, "amount": 5.0},
+            {"instrument_name": "BTC-TEST-C", "timestamp": start + 100, "trade_id": "T1", "price": 0.010, "amount": 5.0}, # Exact duplicate!
+            {"instrument_name": "BTC-TEST-C", "timestamp": start + 200, "trade_id": "T2", "price": 0.011, "amount": 3.0},
+        ]
+        bars = aggregate_hourly_trade_bars(raw_trades, instrument_name="BTC-TEST-C")
+        self.assertEqual(len(bars), 1)
+        bar = bars[0]
+        # Volume must be strictly 8.0 (5.0 + 3.0), not 13.0!
+        self.assertEqual(bar.volume_contracts, 8.0)
+        self.assertEqual(bar.trade_count, 2)
+
+    def test_rejects_zero_or_negative_amount_and_nan_or_inf(self):
+        start = utc_ms(datetime(2026, 9, 9, 1, 0, tzinfo=UTC))
+
+        # Zero amount
+        with self.assertRaisesRegex(HistoricalWindowError, "strictly positive"):
+            clean_and_dedup_trades([{"timestamp": start, "price": 0.01, "amount": 0.0}])
+
+        # Negative amount
+        with self.assertRaisesRegex(HistoricalWindowError, "strictly positive"):
+            clean_and_dedup_trades([{"timestamp": start, "price": 0.01, "amount": -1.0}])
+
+        # Negative price
+        with self.assertRaisesRegex(HistoricalWindowError, "strictly positive"):
+            clean_and_dedup_trades([{"timestamp": start, "price": -0.01, "amount": 1.0}])
+
+        # NaN price
+        with self.assertRaisesRegex(HistoricalWindowError, "NaN or Infinity"):
+            clean_and_dedup_trades([{"timestamp": start, "price": float("nan"), "amount": 1.0}])
+
+        # Inf amount
+        with self.assertRaisesRegex(HistoricalWindowError, "NaN or Infinity"):
+            clean_and_dedup_trades([{"timestamp": start, "price": 0.01, "amount": float("inf")}])
+
+    def test_daily_resolution_aggregation(self):
+        start = utc_ms(datetime(2026, 9, 9, 0, 0, tzinfo=UTC))
+        raw_trades = [
+            {"instrument_name": "BTC-TEST-C", "timestamp": start + 3600_000, "price": 0.010, "amount": 2.0},
+            {"instrument_name": "BTC-TEST-C", "timestamp": start + 7200_000, "price": 0.015, "amount": 3.0},
+            {"instrument_name": "BTC-TEST-C", "timestamp": start + 80_000_000, "price": 0.012, "amount": 1.0},
+        ]
+        bars = aggregate_trade_bars(raw_trades, instrument_name="BTC-TEST-C", resolution="1d")
+        self.assertEqual(len(bars), 1)
+        bar = bars[0]
+        self.assertEqual(bar.bucket_start, start)
+        self.assertEqual(bar.bucket_end, start + DAY_MS)
+        self.assertEqual(bar.open, 0.010)
+        self.assertEqual(bar.high, 0.015)
+        self.assertEqual(bar.close, 0.012)
+        self.assertEqual(bar.volume_contracts, 6.0)
+        self.assertEqual(bar.resolution, "1d")
+
+    def test_trade_bar_to_price_observation_adapter(self):
+        start = utc_ms(datetime(2026, 9, 9, 1, 0, tzinfo=UTC))
+        bar = HourlyTradeBar(
+            instrument_name="BTC-TEST-C",
+            bucket_start=start,
+            bucket_end=start + HOUR_MS,
+            open=0.010,
+            high=0.012,
+            low=0.009,
+            close=0.011,
+            trade_count=3,
+            volume_contracts=10.0,
+            first_trade_at=start + 100,
+            last_trade_at=start + 500,
+            available_at=start + HOUR_MS,
+        )
+        obs = trade_bar_to_price_observation(bar)
+        self.assertIsInstance(obs, PriceObservation)
+        self.assertEqual(obs.instrument_name, "BTC-TEST-C")
+        self.assertEqual(obs.interval_start_ms, start)
+        self.assertEqual(obs.interval_end_ms, start + HOUR_MS)
+        self.assertEqual(obs.available_at_ms, start + HOUR_MS)
+        self.assertEqual(obs.trade_price_btc, Decimal("0.011"))
+        self.assertEqual(obs.trade_size, Decimal("10"))
+        self.assertEqual(obs.price_basis, PriceBasis.TRADE)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,11 @@
 import unittest
 
 from strategies.strategy_schema import (
+    ExpirySelectorType,
+    Selector,
+    StrategyLeg,
     StrategyValidationError,
+    StrikeSelectorType,
     strategy_from_mapping,
     validate_strategy,
 )
@@ -88,6 +92,81 @@ class StrategySchemaTests(unittest.TestCase):
         raw["fee_spread_model"] = "live_order_book_execution"
 
         with self.assertRaisesRegex(StrategyValidationError, "fee_spread_model"):
+            strategy_from_mapping(raw)
+
+    def test_accepts_atm_and_moneyness_and_exact_strike_selectors(self):
+        raw = valid_strategy_mapping()
+        raw["legs"][0]["strike"] = {"type": "atm", "value": 0}
+        raw["legs"][1]["strike"] = {"type": "moneyness_percent", "value": 105.0}
+
+        strat = strategy_from_mapping(raw)
+        self.assertEqual(strat.legs[0].strike.selector_type, StrikeSelectorType.ATM.value)
+        self.assertEqual(strat.legs[1].strike.selector_type, StrikeSelectorType.MONEYNESS_PERCENT.value)
+
+    def test_rejects_delta_target_strike_selector_capability(self):
+        raw = valid_strategy_mapping()
+        raw["legs"][0]["strike"] = {"type": "delta_target", "value": 0.50}
+
+        with self.assertRaisesRegex(
+            StrategyValidationError,
+            "unsupported capability: delta strike selection \\('delta_target'\\) is not supported in V1",
+        ):
+            strategy_from_mapping(raw)
+
+    def test_rejects_duplicate_leg_names(self):
+        raw = valid_strategy_mapping()
+        raw["legs"][1]["name"] = raw["legs"][0]["name"]
+
+        with self.assertRaisesRegex(StrategyValidationError, "duplicate leg name.*long_call"):
+            strategy_from_mapping(raw)
+
+    def test_rejects_unknown_entry_rule(self):
+        raw = valid_strategy_mapping()
+        raw["entry_rules"] = [{"name": "random_martingale_entry"}]
+
+        with self.assertRaisesRegex(StrategyValidationError, "unknown entry rule.*random_martingale_entry"):
+            strategy_from_mapping(raw)
+
+    def test_supports_leg_relations_same_expiry_and_strike(self):
+        raw = valid_strategy_mapping()
+        raw["legs"][1]["same_strike_as"] = "long_call"
+        raw["legs"][1]["same_expiry_as"] = "long_call"
+        raw["legs"][1]["strike_offset_usd"] = 100.0
+
+        strat = strategy_from_mapping(raw)
+        self.assertEqual(strat.legs[1].same_strike_as, "long_call")
+        self.assertEqual(strat.legs[1].same_expiry_as, "long_call")
+        self.assertEqual(strat.legs[1].strike_offset_usd, 100.0)
+
+    def test_rejects_invalid_dte(self):
+        raw = valid_strategy_mapping()
+        raw["legs"][0]["expiry"] = {"type": "days_to_expiry", "value": 0}
+
+        with self.assertRaisesRegex(StrategyValidationError, "invalid DTE"):
+            strategy_from_mapping(raw)
+
+        raw2 = valid_strategy_mapping()
+        raw2["legs"][0]["expiry"] = {"type": "nearest_days_to_expiry", "value": -5}
+        with self.assertRaisesRegex(StrategyValidationError, "invalid DTE"):
+            strategy_from_mapping(raw2)
+
+    def test_rejects_nan_in_leg_and_exit(self):
+        raw = valid_strategy_mapping()
+        raw["legs"][0]["quantity"] = float("nan")
+
+        with self.assertRaisesRegex(StrategyValidationError, "NaN"):
+            strategy_from_mapping(raw)
+
+        raw_exit = valid_strategy_mapping()
+        raw_exit["exit_rules"][0]["value"] = float("nan")
+        with self.assertRaisesRegex(StrategyValidationError, "NaN"):
+            strategy_from_mapping(raw_exit)
+
+    def test_rejects_unexpected_fields_in_strategy(self):
+        raw = valid_strategy_mapping()
+        raw["random_unexpected_field"] = "not_allowed"
+
+        with self.assertRaisesRegex(StrategyValidationError, "unexpected field in strategy.*random_unexpected_field"):
             strategy_from_mapping(raw)
 
 

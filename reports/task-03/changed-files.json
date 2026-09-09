@@ -1,0 +1,32 @@
+[
+  {
+    "path": "ingestion/contract_catalog.py",
+    "before_sha256": "730530fe5ecc1a677673aa2aa5480386d6175a6c1853233d3f0828345d300881",
+    "after_sha256": "20f16f8d1207b5871f59c2839365139020dc12d53f05f015e7c41c9b511036e7",
+    "status": "modified"
+  },
+  {
+    "path": "tests/test_contract_catalog.py",
+    "before_sha256": "2f6ae16cdcf5b04f45e2010b23bb026ff8d5365ddb3c2df9126517109e8cd546",
+    "after_sha256": "3dd193dcab2e0c99c1aefd85f7e56d28f5f8df6e25599dcc0870a698f831b2df",
+    "status": "modified"
+  },
+  {
+    "path": "reports/task-03/tests.txt",
+    "before_sha256": null,
+    "after_sha256": "3980f62a80136a4214da71828cf3015c4b4188a2d86e293e27e8d4c65e7858e7",
+    "status": "created"
+  },
+  {
+    "path": "reports/task-03/changes.patch",
+    "before_sha256": null,
+    "after_sha256": "caa52f3bd65762539537002b26589ab9344e21812b4fc2161d736066e8594d8b",
+    "status": "created"
+  },
+  {
+    "path": "reports/task-03/delivery.md",
+    "before_sha256": null,
+    "after_sha256": "515bd90039ea4b68ed7533bae230fe23dafa0e760acac4834c59f2558aaff194",
+    "status": "created"
+  }
+]

@@ -1,0 +1,122 @@
+{
+  "schema_version": "1.0",
+  "executed_at_utc": "2026-09-09T19:15:11.110621+00:00",
+  "catalog_metadata": {
+    "total_instruments_count": 121544,
+    "payload_sha256": "fe5cce048e7f8f4a050ed16b1a24a63cf0211832ec68f98e0a123610312d25c2"
+  },
+  "resource_consumption": {
+    "requests_made": 19,
+    "max_requests_cap": 5000,
+    "bytes_received": 75715779,
+    "max_bytes_cap": 1073741824,
+    "elapsed_seconds": 39.39,
+    "max_seconds_cap": 3600.0
+  },
+  "gate_decision": {
+    "status": "READY",
+    "reason": "Quarterly observation coverage (100.00%) satisfies the 85% target indicator. Valid zero-trade intervals are strictly separated from errors.",
+    "target_met": true,
+    "quarterly_avg_observation_coverage": "1",
+    "non_quarterly_observation_coverage": "1",
+    "disclaimer": "Bu g\u00f6rev strateji k\u00e2rl\u0131l\u0131\u011f\u0131 kan\u0131tlamaz; veri kaynak yeterlili\u011fi, eksik veri ayr\u0131m\u0131 ve b\u00fct\u00e7e s\u0131n\u0131rlar\u0131n\u0131 belgeler."
+  },
+  "expiries": [
+    {
+      "expiry_name": "29DEC23",
+      "is_quarterly": true,
+      "underlying_spot_usd": "42907.5",
+      "strike_usd": "43000.0",
+      "call_instrument": "BTC-29DEC23-43000-C",
+      "put_instrument": "BTC-29DEC23-43000-P",
+      "call_trades": 734,
+      "put_trades": 296,
+      "call_volume_btc": "42.34015",
+      "put_volume_btc": "19.16075",
+      "trade_coverage": "0.5476190476190476190476190475",
+      "observation_coverage": "1",
+      "call_observed_no_trade_hours": 60,
+      "put_observed_no_trade_hours": 92
+    },
+    {
+      "expiry_name": "29MAR24",
+      "is_quarterly": true,
+      "underlying_spot_usd": "67227.0",
+      "strike_usd": "67000.0",
+      "call_instrument": "BTC-29MAR24-67000-C",
+      "put_instrument": "BTC-29MAR24-67000-P",
+      "call_trades": 658,
+      "put_trades": 305,
+      "call_volume_btc": "57.19679",
+      "put_volume_btc": "20.74505",
+      "trade_coverage": "0.5714285714285714285714285715",
+      "observation_coverage": "1",
+      "call_observed_no_trade_hours": 64,
+      "put_observed_no_trade_hours": 80
+    },
+    {
+      "expiry_name": "28JUN24",
+      "is_quarterly": true,
+      "underlying_spot_usd": "67105.0",
+      "strike_usd": "67000.0",
+      "call_instrument": "BTC-28JUN24-67000-C",
+      "put_instrument": "BTC-28JUN24-67000-P",
+      "call_trades": 462,
+      "put_trades": 58,
+      "call_volume_btc": "19.39277",
+      "put_volume_btc": "5.07138",
+      "trade_coverage": "0.312500000000000000000000000",
+      "observation_coverage": "1",
+      "call_observed_no_trade_hours": 92,
+      "put_observed_no_trade_hours": 139
+    },
+    {
+      "expiry_name": "27SEP24",
+      "is_quarterly": true,
+      "underlying_spot_usd": "57965.5",
+      "strike_usd": "58000.0",
+      "call_instrument": "BTC-27SEP24-58000-C",
+      "put_instrument": "BTC-27SEP24-58000-P",
+      "call_trades": 243,
+      "put_trades": 618,
+      "call_volume_btc": "30.23380",
+      "put_volume_btc": "22.43927",
+      "trade_coverage": "0.5208333333333333333333333335",
+      "observation_coverage": "1",
+      "call_observed_no_trade_hours": 107,
+      "put_observed_no_trade_hours": 54
+    },
+    {
+      "expiry_name": "27DEC24",
+      "is_quarterly": true,
+      "underlying_spot_usd": "100234.0",
+      "strike_usd": "100000.0",
+      "call_instrument": "BTC-27DEC24-100000-C",
+      "put_instrument": "BTC-27DEC24-100000-P",
+      "call_trades": 1323,
+      "put_trades": 808,
+      "call_volume_btc": "197.79349",
+      "put_volume_btc": "39.37731",
+      "trade_coverage": "0.7023809523809523809523809525",
+      "observation_coverage": "1",
+      "call_observed_no_trade_hours": 53,
+      "put_observed_no_trade_hours": 47
+    },
+    {
+      "expiry_name": "26JAN24",
+      "is_quarterly": false,
+      "underlying_spot_usd": "45876.5",
+      "strike_usd": "46000.0",
+      "call_instrument": "BTC-26JAN24-46000-C",
+      "put_instrument": "BTC-26JAN24-46000-P",
+      "call_trades": 1149,
+      "put_trades": 123,
+      "call_volume_btc": "44.01699",
+      "put_volume_btc": "18.38584",
+      "trade_coverage": "0.4761904761904761904761904762",
+      "observation_coverage": "1",
+      "call_observed_no_trade_hours": 36,
+      "put_observed_no_trade_hours": 140
+    }
+  ]
+}
