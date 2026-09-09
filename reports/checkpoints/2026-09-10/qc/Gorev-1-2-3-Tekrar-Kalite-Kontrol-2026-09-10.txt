@@ -1,0 +1,73 @@
+GÖREV 1–2–3 TEKRAR KALİTE KONTROLÜ — 2026-09-10
+
+SONUÇ
+Görev 1: KISMEN DÜZELTİLDİ; REVİZYON GEREKLİ.
+Görev 2: ÖNCEKİ QC BULGUSU KAPANDI; MODÜL DÜZELTMESİ KABUL.
+Görev 3: KISMEN DÜZELTİLDİ; REVİZYON GEREKLİ.
+Görev 2 kabulü, Görev 1 ortak sözleşmesinin veya tüm ürünün kabulü değildir.
+
+YÖNTEM / KANIT
+- Yalnız 1–3'ün önceki QC bulgularına odaklanıldı; alt ajan kullanılmadı. Önceki 4–6 ajanı durduruldu.
+- Masaüstü gptgorevraporlarma/1.txt,2.txt,3.txt güncel revizyon raporları okundu; rapor iddiaları gerçek kodla karşılaştırıldı.
+- Kaynak: C:\Users\user\Documents\Codex\2026-09-08\tes\deribit-options-backtest-catalog
+- Kaynak tam regresyon: 256 test / OK.
+- İlgili modüller: tests.test_contracts_v1 + tests.test_backtest_engine + tests.test_contract_catalog -> toplam 50 test / OK (15+15+20).
+- Temiz baseline SHA: d804d811eca7ce589509d4fe8f5bdc2bc23b423d.
+- Yeni temiz kopya: C:\Users\user\Documents\Codex\2026-09-09\en\work\qc123-recheck-20260910
+- Güncel 01,02,03 yamaları bu kopyaya hatasız uygulandı. Tam test: 98 çalıştırıldı, 97 geçti, 1 atlandı; OK (skipped=1).
+- Atlanan test gerçek pilot örneği testi: reports/pilot/catalog_sample.json teslimlerde bulunmadığından temiz kopyada skip oluyor. Ana kaynakta aynı test geçti; taşınabilir fixture kanıtı eksik.
+- Üç changed-files.json içindeki after_sha256 değerlerinin tamamı mevcut dosyalarla eşleşti.
+- Kaynak dosyaları değiştirilmedi; commit/push yapılmadı. Bu rapor yeni bir tam proje denetimi değildir.
+
+GÖREV 1 — KAPANAN BULGULAR
+Decimal normalizasyonu ve aritmetik/JSON string; PriceObservation NaN/negatif boyut ve erken bar availability reddi; varsayılan quote=BTC ve ayrı counter=USD alanı; sıfır işlem için win_rate=None desteği; strict from_dict bilinmeyen alan reddi; manifest kendi-hash döngüsü düzeltmesi doğrulandı.
+Baseline kaynağı artık erişilebilir git commit olarak açıklanıyor; eksik ZIP teslim edilmiş gibi sunulmuyor.
+
+GÖREV 1 — KALANLAR
+P1 / G1-A: Typed arayüz açığı kapanmamış.
+core/contracts.py:999 HistoricalTradeProvider.fetch Union[...,Any]; :1007 InstrumentProvider.load Any; :1104 runner data_bundle Union[...,Any] kabul ediyor. Union içine Any eklemek sınırı yeniden gevşetir. Mapping[str,Any] alternatifleri de gerekli alanların varlığını tanımlamıyor.
+Yeni Protocol isimleri tek başına yeterli değil: StrategyProtocol yalnız name, DownloadPlanProtocol yalnız instrument_name, HistoryAsOfProtocol yalnız decision_at_ms tanımlıyor. Veri indirme zaman aralığı ve strateji bacakları gibi gerekli alanların sözleşmesi hâlâ eksik. Runtime isinstance testi imza/alan tipi uyumunu kanıtlamaz.
+Teslim raporundaki 'tüm Any kaldırıldı' iddiası yanlış. JSON serileştirici yardımcılarında Any bulunması başlı başına sorun değil; kritik olan modül giriş/çıkış sözleşmelerindeki kaçış yollarıdır.
+Düzelt: gerçek consumer ihtiyaçlarını taşıyan kesin Protocol/dataclass/TypedDict tanımla; sınır imzalarından çıplak Any alternatifini kaldır; uyum testleri ekle.
+
+P1 / G1-B: Execution modeli anlamları hâlâ görev emriyle çelişiyor.
+orchestration/tasks/11.txt:10 Model A trade-based estimated, Model B historical bid/ask replay der. specs/product-v1.md ve specs/contracts-v1.md ise A=bid/ask, B=mid/slippage, C=trade_bar_close tanımlar. Bu eski QC'de de açık bırakılmıştı.
+Düzelt: tek kanonik model sözlüğü, açık migration/alias politikası ve decision sonrası fill zamanını tanımla; tüketicilere etkiyi belgeleyip onaya sun. Başka görev kaynaklarını bu revizyonda izinsiz değiştirme.
+
+P2 / G1-C: tick_schedule ve ayrı spread/slippage teslim edilmemiş.
+core/contracts.py:317 yalnız tek tick_size; :634 yalnız spread_slippage_cost_btc toplamı var. Görev1 ortak emir tick_schedule, Görev15 ise spread/slippage ayrımı ister. Revizyon raporu bunları kapatmış gibi 'tüm P1/P2' dememeli.
+Düzelt: gerekli şema alanları ve roundtrip/migration testleri ya da açık contract-request/eksik kaydı.
+
+P2 / G1-D: Modül matrisi kısmen düzeltilmiş.
+specs/contracts-v1.md:2. bölüm compute_metrics için engine/metrics.py diyor; Görev15 yazma sınırı reporting/**. Eski yanlış eşlemenin bir kısmı sürüyor. Matrisi task dosya sahiplikleriyle birebir uzlaştır.
+
+GÖREV 2 — KABUL
+strategies/backtest_engine.py:164 ve devamı desteklenen entry adı altında dolu parameters geldiğinde BacktestEngineError üretiyor. Yeni regresyon bu yolu kapsıyor; ilgili 15 test geçti. Son ortak gözlemden kapanış ve önceki diğer güvenlik kontrolleri korunmuş. Önceki görevlerin kabul edildiğine ilişkin erken ifadeler güncel teslim raporunda kaldırılmış.
+Bu kapsamda yeni engelleyici bulgu yok. Çoklu işlem/sinyal/settlement sistemi kabul edilmiş değildir; bu legacy modül kendi kapsamıyla kabul edilir.
+
+GÖREV 3 — KAPANAN BULGULAR
+Gerçek yerel Deribit pilot kayıtları artık parse ediliyor; isimdeki tarih ile timestamp UTC takvim günü eşleşmesi kontrol ediliyor; hedef DTE NaN/Infinity/bool reddi doğrulandı. Geçerli tarihli 120.000 kayıt benchmark'ı, tracemalloc ölçümü ve contracts_scanned sayacı testlerde mevcut ve geçti. Performans test eşiği bu makinedeki fixture kanıtıdır, her makine/evren için garanti değildir.
+
+GÖREV 3 — KALANLAR
+P1 / G3-A: Doğrudan ContractSpec constructor tutarlılığı hâlâ eksik.
+Yer: ingestion/contract_catalog.py:109–159.
+Bağımsız deneme: geçerli BTC-27DEC24-90000-C kaydı dataclasses.replace ile strike=1.0; option_type='put'; underlying='ETH'; creation_timestamp=-1 şeklinde ayrı ayrı değiştirildi. Dört nesne de constructor ve HistoricalContractCatalog tarafından kabul edildi.
+İsim/tarih kontrolü eklenmiş ancak isimdeki strike/C-P ve underlying alanıyla çapraz kontrol yapılmıyor; creation negatifliği de reddedilmiyor.
+Düzelt: JSON parse ve doğrudan constructor aynı tutarlılık doğrulamasını paylaşmalı. Her dört karşı örnek için ret testi ekle.
+
+P2 / G3-B: Para birimi düzeltmesi fazla gevşek.
+Yer: ingestion/contract_catalog.py:439–445.
+quote_currency hem BTC hem USD; counter_currency hem USD hem BTC kabul ediliyor. Bağımsız denemede quote=USD,counter=BTC ters kombinasyonu BTC inverse olarak parse edildi. Gerçek BTC kaydını kabul etmek olumlu, ama yanlış birim kaydını da sessiz geçirmek güvenli normalizasyon değildir.
+Düzelt: kanonik quote=BTC,counter=USD tutarlılığı; eski format desteklenecekse açık ayrı legacy giriş politikası ve normalizasyon/etiket, sessiz karışım değil. Fixture'ları doğru birimlerle güncelle.
+
+P2 / G3-C: Gerçek kayıt regresyonu temiz teslimde atlanıyor.
+Yer: tests/test_contract_catalog.py:264–266.
+Düzelt: küçük ve güvenli gerçek örneği test dosyasına göm veya izinli/teslim edilen fixture olarak paketle; dosya bulunamazsa önemli kabul testi sessiz skip olmamalı.
+
+KISA DÜZELTME SIRASI
+1. G1-A/B: kesin arayüzler ve tek model sözlüğü.
+2. G3-A/B: doğrudan constructor ve para birimi tutarlılığı.
+3. G1-C/D ve G3-C: eksik şema/matris ve taşınabilir regresyon.
+4. Aynı üç yamayı temiz kopyada tekrar test et; task2'yi gereksiz yeniden yazma.
+
+Nihai hüküm: anlamlı ilerleme var; Görev2 kapanabilir. Görev1 ve3 için 'tüm sorunlar giderildi' onayı henüz verilemez.

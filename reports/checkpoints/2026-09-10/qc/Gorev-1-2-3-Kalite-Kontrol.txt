@@ -1,0 +1,43 @@
+GÖREV 1–2–3 BAĞIMSIZ KALİTE KONTROLÜ — 2026-09-09
+
+KAPSAM
+Masaüstü gptgorevraporlarma/1.txt,2.txt,3.txt; kaynak görev emirleri; gerçek kaynak/test/teslim hash'leri. Diğer 4–14 teslimleri kalite kontrol kapsamına alınmadı. Mevcut ortak klasörde diğer görevlerin değişiklikleri bulunduğundan d804d81 temiz kaynak kopyasına yalnız 01,02,03 yamaları uygulandı. Kaynak projede edit, commit/push yapılmadı.
+
+KANIT
+- Üç görev patch'i git apply --check ile kabul edildi ve temiz kopyaya uygulandı.
+- Temiz kopya: python -m unittest discover -s tests -q -> 89 test / OK.
+- Ayrı modül kontrolleri: Görev1 10/10; Görev2 14/14; Görev3 17/17.
+- Teslim manifestlerindeki üretim ve test dosyalarının SHA256 değerleri mevcut dosyalarla eşleşti.
+- Görev1 changed-files.json kendi hash'ini de içeriyor ve kendi satırı eşleşmiyor. Manifest kendi kendisini hash'lememeli; hash dış receipt'te tutulmalı.
+- reports/baseline içinde manifest ve sha256sums mevcut, istenen kaynak kopyası/ZIP yok. Temiz baseline git commit ile erişilebilir; raporda kopya teslimi tamamlandı gibi belirtilmemeli.
+- Görev2/3 raporları önceki görevleri 'kabul edildi' yazıyor; bu sohbet içinde böyle bir önceki ana-orkestratör kabulü verilmedi.
+
+GÖREV1: REVİZYON GEREKLİ / KABUL EDİLMEDİ
+P1 — Typed arayüz şartı ihlali: core/contracts.py:863 selector strategy/asof_view Any; :903 data_bundle Any; diğer provider/execution parametreleri de Any. specs/contracts-v1.md modül matrisi görevlerdeki strategies/selection.py, strategies/signals.py, execution/, portfolio/, engine/, reporting/ yolları yerine başka yollar kilitliyor. Consumer/producer sözleşmesi henüz güvenle kilitlenemez.
+P1 — Decimal validasyonu dönüştürülen değeri nesneye atamıyor. core/contracts.py:304 ve benzeri __post_init__ çağrıları validate_decimal dönüşünü kullanmıyor. Bağımsız deneme make_sample_instrument(strike_usd='90000') -> alan tipi str; strike_usd=90000.5 -> JSON sayısı (string değil). Finansal alanları ya Decimal dışında reddet ya frozen nesneye normalize et; roundtrip ve aritmetik testlerini ekle.
+P1 — PriceObservation boyutları doğrulanmıyor: trade_size=Decimal('NaN') kabul edildi. interval_start=0,interval_end=3600000,observed_at=available_at=0 biçimindeki bar observation da kabul edildi. Bar kapanışını temsil eden observation için bucket_end availability ve first/open/close ayrımı açık olmalı. available_at>=observed_at tek başına sıfır lookahead kanıtı değildir.
+P1 — Para birimi sözlüğü: quote_currency strike currency diye USD tanımlanmış; BTC inverse option premium quote BTC, counter/strike currency USD olarak ayrılmalı. core:291 ve specs alan açıklaması düzeltilecek.
+P2 — metrics.win_rate Decimal zorunlu; Görev15'in sıfır işlem için null şartını karşılamıyor. Tick schedule tek tick_size'a indirilmiş; spread/slippage ayrımı tek toplam alana sıkışmış. Bu alanlar sonraki görevleri zorlamadan önce orkestratör onaylı sözleşme revizyonuyla çözülmeli.
+P2 — from_dict bilinmeyen alanları sessiz atlıyor. misspelled_config=123 kabul edildi; strict config sözleşmesinde ret gerekir.
+Model A/B anlamları ve eklenen trade_bar_close modeli planla eşleştirilmeli; gelecek ajanlara farklı execution semantiği bırakılmamalı.
+
+GÖREV2: ANA DÜZELTMELER DOĞRULANDI / KÜÇÜK REVİZYONLA YENİDEN KONTROL
+Son ortak gözlemden kapanış ve end_of_data doğru; duplicate timestamp, instrument değişimi, NaN/Inf ve negatif maliyet reddi testlerde geçti. Legacy USD cashflow etiketi mevcut; 14 test temiz baseline üzerinde geçti.
+P2 — strategies/backtest_engine.py:157 yalnız entry rule adına bakıyor. Desteklenen adın parameters alanına {'unsupported_filter':True} eklenince hata yerine 1 işlem açılıyor. Bu motor parametre değerlendirmediğinden desteklenmeyen/nonempty parametreleri reddet veya gerçekten desteklediği parametreleri allowlist ile uygula. Sessizce filtre atlanması backtestin farklı strateji çalıştırmasına yol açar.
+Resmi settlement motoru görevi6/12 kapsamındadır; bu legacy modülde sıfır fiyat kabulü o motorun doğrulandığı anlamına gelmez. Görev1'in kabul önkoşulu da henüz karşılanmadı.
+
+GÖREV3: REVİZYON GEREKLİ / KABUL EDİLMEDİ
+P1 — ingestion/contract_catalog.py:301-303 quote_currency USD zorunluluğu gerçek BTC inverse option kaydını reddediyor. Yerel reports/pilot/catalog_sample.json sample_records[0] BTC-15JUL16-600-C quote_currency=BTC; _parse_contract -> ContractCatalogError. Pilot dosyasının wrapper'ı farklı olduğundan ham sample_records satırı doğrudan parse edilerek doğrulandı.
+Resmi örnek: https://docs.deribit.com/api-reference/market-data/public-get_instrument BTC-13JAN23-16000-P için quote_currency BTC ve counter_currency USD gösterir. Futures örneği opsiyona uygulanmamalı.
+P1 — expiry tarih tutarlılığı eksik. BTC-27DEC24-90000-C isimli kayıt creation_timestamp=1000,expiration_timestamp=2000 ile kabul edildi. İsim tarihi ile expiry timestamp karşılaştırılmalı; tarihsel expiry saati ayrıca kaynakla doğrulanmalı, kör sabitlenmemeli. Constructor üzerinden ContractSpec de yalnız dedup edilip validation'ı atlayabiliyor.
+P2 — CatalogQuery target_dte_days=NaN validasyondan geçiyor; min/max NaN/Inf ham ValueError/OverflowError doğurabilir. Tüm DTE değerleri sonlu ve bool olmayan sayılar olarak kontrol edilmeli.
+P2 — 120000 kayıt testi geçti, ancak bellek ölçümü yapılmamış; candidates_evaluated expiry sayısı, taranan kontrat sayısı değil. Rapordaki tam performans/bellek kanıtı iddiası daraltılmalı. Sentetik benchmark'ta 00DEC24/99DEC24 gibi gerçek olmayan isimler var; yeni tarih validasyonunu aşan fixture kullanılmamalı.
+Olumlu: creation/expiry sınırı, is_active=False tarihsel kullanım, aynı kayıt dedup, preferred expiry eksikse fallback ve strike tie-break senaryoları testlerde geçti.
+
+ÖNERİLEN DÜZELTME SIRASI
+1. Görev1 ortak sözleşmesini düzelt; tüm downstream arayüz etkilerini haritala. 4–14'ün bozuk olduğu bu kontrolden çıkarılamaz; ancak revize sözleşmeye uyumları sonradan yeniden kontrol edilmeli.
+2. Görev3 gerçek BTC quote + metadata tarih/sayı validation düzeltmeleri.
+3. Görev2 parametre reddi ve teslim belgelerindeki erken kabul ifadeleri.
+4. Aynı temiz baseline yaklaşımıyla tekrar QC; sonra kabul ve entegrasyon.
+
+Bu rapor uygulama yapmaz. Mevcut üretim kaynakları değiştirilmedi, GitHub push yapılmadı.

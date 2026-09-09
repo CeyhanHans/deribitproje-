@@ -1,0 +1,56 @@
+GÖREV 1–2–3 SON TESLİM DENETİMİ — 2026-09-10
+
+KARAR
+Görev 1: REVİZYON GEREKLİ. İlerleme doğrulandı; tam kabul verilmedi.
+Görev 2: KORUNDU; önceki kapsam içi kabul geçerli.
+Görev 3: ÖNCEKİ G3-A/B/C BULGULARI KAPANDI; bu revizyon kapsamıyla kabul.
+Bu karar ana kaynağa birleştirme veya tüm backtest ürününün kabulü değildir.
+
+KANIT
+Teslim kopyası: C:\Users\user\Documents\Codex\2026-09-09\en\work\qc123-fix-20260910
+Kaynak ve teslim HEAD: 61101f29f1edb7b15b28854c5e00e66873a2e941.
+Önceki denetimdeki d804d81 artık güncel baseline değil; bu kontrolde canlı doğrulandı.
+Teslim kopyasında full discover: 262 test / OK, skip yok.
+Bağımsız temiz klon: C:\Users\user\Documents\Codex\2026-09-09\en\work\qc123-final-audit
+01 ve03 yamaları git apply --check kontrolünden geçti ve uygulandı. Bu temiz klonda da full discover: 262 test / OK, skip yok. Sadece markdown satır sonu boşluk uyarısı alındı; yama engeli değil.
+01/03 manifest after_sha256 değerlerinin tamamı teslim dosyalarıyla eşleşti.
+Git diff/status içinde yalnız izin verilen yedi kaynak/test/spec dosyası ve task-01/task-03 teslim dosyaları değişmiş görünüyor.
+Görev2 dosya hash'leri önceki kabuldekiyle aynı:
+strategies/backtest_engine.py: d877e4063c467036972feebdfa537b96f7d1d9698019877b50439219f5f08711
+tests/test_backtest_engine.py: 8aeda9553654fe7552b55da722464eb914cff0f46c37309e066ef145f0283931
+Bu denetimde alt ajan çalıştırılmadı, üretim kodu değiştirilmedi, merge/commit/push yapılmadı.
+
+GÖREV3 KABUL GEREKÇESİ
+Constructor/replace yolu isim-strike, C/P, underlying ve negatif creation tutarlılığını kontrol ediyor. Kanonik para birimleri doğrulanıyor; ters quote/counter reddediliyor. Gerçek pilot örneği test dosyasında mevcut ve temiz kopyada atlanmadan çalışıyor. Önceki G3-A/B/C düzeltmeleri test ve kodda doğrulandı.
+
+GÖREV1 KALAN BULGULAR / UYGULAYICIYA NET DÖNÜŞ
+
+1. P1 — Arayüzlerin gerçek tüketicilerle uyumu ve etki raporu eksik.
+Yer: core/contracts.py:1179,1187,1219,1277.
+Somut core.DownloadPlan, DownloadPlanProtocol kontrolünü geçiyor; fakat DeribitHistoricalTradeProvider.fetch(core.DownloadPlan(...)) ValidationError('plan must be an instance of HistoryDownloadPlan') ile reddediliyor. Ağ isteği oluşmadan doğrulandı.
+FeeScheduleProtocol rate alanı istiyor; mevcut gerçek FeeSchedule nesnesi bu protokole uymuyor (isinstance=False).
+DataBundleProtocol, event_engine.py:142'nin çağırdığı get_underlying_price_at metodunu belirtmiyor.
+Sonuç: kritik Any alternatifleri kaldırılmış, ancak isimlerin kesin tipli olması tüketici uyumunu tek başına sağlamamış. Bu uyumsuzluklar görev4/6/13 kaynaklarını değiştirme izni değildir.
+EMİR: Ortak sözleşmeyi tüketicilerin gerçek ihtiyaçlarıyla eşleştir. Temsili gerçek provider/config/bundle nesneleriyle sınır uyum testleri ekle. İzin dışı değişiklik gerekiyorsa reports/task-01/contract-request.md içinde çağıran/sağlayan/imza/etki/önerilen geçiş tablosunu yaz ve G1-A'yı PARTIAL olarak işaretle. Gizlice tüketici dosyalarını değiştirme.
+
+2. P2 — Yeni Fill maliyet yolu Decimal normalizasyonunu atlıyor.
+Yer: core/contracts.py:780–789.
+spread_cost_btc ve slippage_cost_btc ikisi de doluyken toplam önce validate_decimal'dan geçmeden çıkarma işlemine giriyor.
+Bağımsız denemeler (örnek Fill dataclasses.replace ile):
+- toplam='0.3', spread=Decimal('0.1'), slippage=Decimal('0.2') -> TypeError.
+- toplam=0.3, aynı ayrım -> TypeError.
+- toplam=Decimal('NaN'), aynı ayrım -> decimal.InvalidOperation.
+EMİR: Toplamı her dalda aritmetik öncesi normalize/doğrula. Geçerli string/float girdiler sözleşmedeki gibi Decimal'e dönüşmeli; NaN/Inf/bool/negatif ValidationError üretmeli. İki bileşen mevcutken tutarsız toplam için açık ret testi ekle. Eksik toplam ile açıkça verilmiş sıfırı aynı kabul edip etmeyeceğini belgele; sessizce yanlış toplam düzeltme. Legacy yalnız toplam davranışını koru ve test et.
+
+3. P2 — TickSchedule frozen görünmesine rağmen liste üzerinden değişebiliyor.
+Yer: core/contracts.py:372–402.
+steps=list ile oluşturma kabul ediliyor; __post_init__ sıralamayı o anda kontrol ediyor ama liste referansını saklıyor.
+Deneme: önce threshold0.01 ile oluşturuldu; dış listedeki append ile threshold0.005 eklendi. Nesnenin steps alanı ['0.01','0.005'] oldu, sıralama kuralı sonradan bozuldu.
+EMİR: steps girişini tuple'a normalize et veya tuple dışında açık ret ver. Dış liste mutasyonu nesneyi değiştirmemeli. Aynı sorunu yeni HistoryAsOfView.completed_bars ve StrategySpec.legs gibi tuple ilan edilen yeni koleksiyonlarda da kontrol et; doğrulamayı sonradan atlatan mutable referans bırakma. Regresyon: oluşturduktan sonra kaynak listeyi değiştir, nesne invariant'ı korunmalı.
+
+BELGE DÜZELTMESİ
+reports/task-01/delivery.md, InstrumentProvider.load için plan:DownloadPlanProtocol yazıyor; gerçek imza snapshot:Union[Path,str,Sequence[Instrument],InstrumentSnapshotProtocol]. Runner açıklamasında execution_config yazıyor; gerçek runner imzasında bu parametre yok. İmza tablosunu gerçek koddan doğrulayarak düzelt.
+Model A/B kanonik isimleri eklenmiş; legacy kimlikler aynı eski kimliklere dönüyor. resolve_canonical_execution_model adının 'legacy kimliği koruyan doğrulama' mı 'yalnız A/B'ye dönüştürme' mi olduğu açık yazılmalı. Mevcut legacy tüketicilerin yeni modelleri desteklediği iddia edilmemeli; etki raporu gerekli.
+
+YENİDEN TESLİM
+Yalnız Görev1 izinli kaynak/test/spec ve reports/task-01 alanını revize et. Görev2/3 kaynaklarını tekrar yazma. Yukarıdaki üç bulgu için negatif/pozitif regresyonları ekle, tüm testleri tekrar çalıştır, patch/hash/test çıktıları ve etki tablosunu güncelle. Geçmeyen veya yapılmayan kontrolleri açıkça yaz. Ana kaynağa birleştirme/push yapma.

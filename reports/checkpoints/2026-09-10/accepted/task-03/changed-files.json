@@ -1,0 +1,32 @@
+[
+  {
+    "path": "ingestion/contract_catalog.py",
+    "before_sha256": "20f16f8d1207b5871f59c2839365139020dc12d53f05f015e7c41c9b511036e7",
+    "after_sha256": "7c11e309ac2ce1e01c035af71a7de50700a48441f3726abb4b9bf7d8396906f5",
+    "status": "modified"
+  },
+  {
+    "path": "tests/test_contract_catalog.py",
+    "before_sha256": "7730a7734aa1d4dfccf29b0bc02ef71c4c7e9c08a44d4fdb0af3384d056d50e2",
+    "after_sha256": "f97a496dd1709641a71c8fcdb3945bc90301ac0b64313e1eedb61e893c8d5810",
+    "status": "modified"
+  },
+  {
+    "path": "reports/task-03/tests.txt",
+    "before_sha256": "49b9df4cb11fb7e65b75fad1c5c72cdbc3f7d14cdc7189f97b8fe6809c4edbe8",
+    "after_sha256": "f100141939c46b27ad3f1484b0c2a91fd87bcf502e77b473f513de8806da983e",
+    "status": "modified"
+  },
+  {
+    "path": "reports/task-03/changes.patch",
+    "before_sha256": "62d36056d1df8807798dd7c3fceaf986024638538fb9c46eb1a6923ad5bbd5e9",
+    "after_sha256": "6ae987a8e4e462347bd6ecf0ba1f1adf426ee94f0ffab89e9e8cc9366a5a0ce4",
+    "status": "modified"
+  },
+  {
+    "path": "reports/task-03/delivery.md",
+    "before_sha256": "94b7e33897993a806d9dea1683adc7adbbc85c7fc31103adb4cb7d07e2cc48fe",
+    "after_sha256": "13c609817f6c4a3293d2919a6baaacf91e8ccaa49c6aec7969276101b37442dd",
+    "status": "modified"
+  }
+]

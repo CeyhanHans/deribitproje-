@@ -1,0 +1,123 @@
+GÖREV 4–5–6 BAĞIMSIZ KALİTE KONTROLÜ — 2026-09-09
+
+SONUÇ
+Görev 4: REVİZYON GEREKLİ / KABUL EDİLMEDİ.
+Görev 5: REVİZYON GEREKLİ / KABUL EDİLMEDİ.
+Görev 6: REVİZYON GEREKLİ / KABUL EDİLMEDİ.
+Mevcut testler yeşil; fakat bağımsız karşı örnekler veri bütünlüğü ve yanlış sonuç riski gösteriyor. Bu karar sistemin yapılamayacağı anlamına gelmez. Bu teslimler mevcut haliyle güvenilir backtest için kabul edilemez.
+
+KAPSAM VE YÖNTEM
+Kaynak: C:\Users\user\Documents\Codex\2026-09-08\tes\deribit-options-backtest-catalog
+Teslim raporları: C:\Users\user\Desktop\gptgorevraporlarma\4.txt, 5.txt, 6.txt.
+Görev emirleri: orchestration/tasks/4.txt, 5.txt, 6.txt; gerçek kaynaklar ve reports/task-04,05,06 teslimleri karşılaştırıldı. TXT içindeki tamamlanma iddiaları kanıt değil, denetlenecek iddia olarak ele alındı.
+İzole kontrol kopyası: C:\Users\user\Documents\Codex\2026-09-09\en\work\qc-tasks-123
+Bu kopya d804d811eca7ce589509d4fe8f5bdc2bc23b423d tabanına 1–3 teslimlerinin uygulanmış halinden devam eder. 4 ve 5 yamaları uygulandı. 6 yaması başarısız oldu; yalnız manifestteki beş kaynak/test/belge dosyası kaynak kopyadan alınarak test edilebildi. Dolayısıyla 140 test sonucu, Görev 6 yamasının taşınabilir olduğu anlamına gelmez.
+Üretim kaynaklarında düzeltme, commit veya GitHub push yapılmadı. Alt ajan çalıştırılmadı. Testlerin geçici dosyaları yalnız izole deneme alanlarında oluşturuldu.
+
+DOĞRULANAN KANIT
+- 4 ve 5 eklendikten sonra: python -m unittest discover -s tests -q -> 120 test / OK.
+- 6'nın manifest dosyaları ayrıca kopyalandıktan sonra: aynı komut -> 140 test / OK.
+- Üç teslimin changed-files.json içindeki bütün after_sha256 değerleri mevcut kaynak/teslim dosyalarıyla eşleşti.
+- Bağımsız karşı denemeler: C:\Users\user\Documents\Codex\2026-09-09\en\work\qc456_probes.py
+- Karşı denemeler aşağıdaki hataları yeniden üretti. Bu dosya düzeltme değil, teşhis senaryolarıdır; programın çıkış kodu 0 olması ürünün PASS olduğu anlamına gelmez.
+- Canlı tarihsel veri indirme/uzun dönem backtest, kesinti altında süreç yeniden başlatma, büyük veri bellek ölçümü ve gerçek eşzamanlı yazıcı dayanıklılığı bu kontrolde UNVERIFIED. 140 offline test bunların yerine geçmez.
+
+GÖREV 4 — İNDİRME, SAYFALAMA, RESUME
+
+P1 / 4.1 — Resume yanlış tarih aralığına ait veriyi COMPLETE kabul ediyor.
+Yer: ingestion/history_download.py:327–345.
+Cursor yalnız instrument_name ile eşleştiriliyor; tarih aralığı/sıralama/plan kimliği yok. Tüm trade_page_ anahtarları geri yükleniyor.
+Deneme: eski cursor start=1500 ve kayıt timestamp=1000; yeni istek [4000,5000). Ağ isteği 1500'den başladı, eski 1000 kaydı döndü; sonuç COMPLETE, is_complete=True.
+Etki: kullanıcının seçtiği dönemin dışındaki işlemler yeni koşuya karışabilir, eksik dönem tamamlandı sanılabilir.
+Kabul koşulu: plan+enstrüman+tarih+sıralama+şema kimliğiyle ayrılmış cursor/page namespace; uyuşmayan resume açıkça reddedilmeli. Farklı dönem/enstrüman ve aynı store kullanımı test edilmeli.
+
+P1 / 4.2 — Sequence devamı istek sınırını aşıyor, zaman aralığı dışı veri ekliyor; kalıcılaştırma eksik.
+Yer: ingestion/history_download.py:439–464 ve :539–590.
+Sequence çağrısı pages_fetched/total_bytes_fetched hesabına katılmıyor; kendi bütçe kontrolü yok. Gelen kayıtlar [start,end) filtresinden geçmeden ekleniyor. Sequence kayıtları store'a yazılmıyor; başarılı köprüleme sonrası continue, cursor yazımını da atlıyor.
+Deneme: count=1, max_pages=1, istek [1000,2000); zaman sayfası 1000, sequence sayfası 3000. Gerçek çağrı=2, raporlanan sayfa=1, raporlanan byte=100 (gerçekte iki adet 100 byte yanıt); çıktı timestamp'leri [1000,3000].
+Ek statik bulgu: tek sequence sayfası hâlâ aynı milisaniyedeyse sonraki sequence sayfasına devam edilmiyor; INCOMPLETE olarak bırakılıyor. Bu dürüst kısmi durum olsa da kayıpsız tamamlama hedefi tamamlanmış değil.
+Kabul koşulu: iki endpoint ortak bütçe, ortak [start,end) filtresi, ortak kalıcı sayfa/cursor işlemi kullanmalı. Çok sayfalı aynı-ms taşması; artan/azalan ve sırasız yanıt; sequence sonrası kesinti/resume; yeniden indirmenin birebir eşitliği test edilmeli.
+
+P1 / 4.3 — trades_sha256 fiyat ve miktar değişimini görmüyor.
+Yer: ingestion/history_download.py:501–506.
+Hash yalnız timestamp/seq/id üzerinden. Aynı kaydın fiyatı 0.01 yerine 0.99 yapıldığında hash aynı kaldı.
+Etki: ekonomik veri değiştiği halde aynı veri seti sanılır; sonuç tekrar üretilebilirliği kanıtı geçersizleşir.
+Kabul koşulu: deterministik biçimde tüm ekonomik alanlar, birimler ve kayıt kimliği hash'e girmeli; fiyat/miktar değişim testi hash'i değiştirmeli. JSON sayılarının float üzerinden hassasiyet kaybı olmadan alınması da kontrol edilmeli.
+
+P2 / 4.4 — Eksik/çelişkili yanıt tam veri gibi sınıflandırılıyor; süre/byte limitleri kesin değil.
+Yer: ingestion/history_download.py:398; ingestion/deribit_history.py:225–265.
+trades=[] ve has_more=True karşı denemesi EMPTY + is_complete=True döndü. Timestamp'siz dolu sayfa yolu da hata yerine döngüyü tam kabul ederek bitirebiliyor.
+HTTP okuma tüm gövdeyi tek seferde alıyor; toplam kalan süre retry beklemelerine/timeout'a iletilmiyor. Plan max_retries için üst sınır 5'i zorlamıyor.
+Kabul koşulu: çelişkili/malformed yanıt tamamlanmış sayılmamalı; ağ okuma, retry ve iki pagination yolu ortak bütçeye tabi olmalı. Limitler hard cap değilse açıkça soft cap diye belgelenmeli ve görev şartı orkestratörle uzlaştırılmalı.
+
+Olumlu: zaman sınırında overlap, deterministik sıralama/dedup, kısmi sonuç reason code'ları ve retry iskeleti var; mevcut offline regresyon geçti.
+
+GÖREV 5 — ARŞİV, CACHE, İÇE/DIŞA AKTARIM
+
+P1 / 5.1 — Aynı bundle ikinci kez içe aktarılamıyor.
+Yer: storage/engine.py:237.
+hashlib.sha256 kullanılıyor ama hashlib import edilmemiş.
+Deneme: export -> yeni depoya import başarılı -> aynı bundle tekrar import: NameError: name 'hashlib' is not defined.
+Kabul koşulu: eksik import giderilmeli; gerçekten import_bundle iki kez çağrılarak kayıt sayısı, arşiv sayısı ve checksum değişmediği doğrulanmalı. Mevcut idempotency testi bu yolu kapsamıyor.
+
+P1 / 5.2 — Eksik arşiv tam cache hit; okuma/ihracat sessizce atlıyor.
+Yer: storage/engine.py:123–143 ve :181.
+Cache yalnız indeks kaydını kontrol ediyor. Arşiv dosyası yoksa stream_trades continue yapıyor; export da eksik dosyayı atlıyor.
+Deneme: yalnız geçici test deposunda arşiv yeniden adlandırıldı. find_cache_hit=True iken stream sonucu 0 kayıt oldu, hata verilmedi.
+Etki: eksik veri, sıfır işlem dönemi sanılabilir ve offline teslim sessizce eksilebilir.
+Kabul koşulu: indeks-arşiv tutarlılığı doğrulanmalı. Eksik/bozuk dosya yapılandırılmış hata veya açık INCOMPLETE üretmeli; boş dönem sayılmamalı. Export bütün beklenen arşivleri kapsadığını kanıtlamalı.
+
+P2 / 5.3 — INCOMPLETE -> COMPLETE güncellemesi metadata'yı tutarsız bırakıyor.
+Yer: storage/sqlite_index.py:114–138; storage/engine.py:97–120.
+Güncellemede coverage_ratio, source_url/source_params ve archive_id yeni manifestle eşleşmiyor.
+Deneme: coverage=0.2/source=partial kayıt 1.0/finished ile tamamlandı. İndeks COMPLETE olmasına rağmen coverage=0.2/source=partial kaldı; store_trades dönüşündeki archive_id indeks id'sinden farklıydı.
+Ek risk: completion upgrade farklı hash'i koşulsuz kabul ediyor; eski aynı trade kimliğinin fiyatının değişmesi de normal tamamlama olarak geçebilir.
+Kabul koşulu: kimlik semantiği sabitlenmeli; metadata atomik ve tutarlı güncellenmeli; geçmiş kayıtlarla çelişen ekonomik içerik açık conflict olarak ele alınmalı.
+
+Olumlu: gzip JSONL + SQLite temeli, Decimal-string roundtrip, okuma checksum kontrolü, path traversal kontrolleri ve mevcut offline testler çalışıyor. Bu olumlu sonuçlar eksik dosya/re-import hatalarını ortadan kaldırmıyor.
+
+GÖREV 6 — UNDERLYING, SETTLEMENT VE ÜCRETLER
+
+P1 / 6.1 — Yanlış endeks/vade ve bozuk sembol resmi settlement olarak kabul ediliyor.
+Yer: ingestion/settlement.py:328–397.
+Depo sadece timestamp ile anahtarlanıyor. BTC kontratı için eth_usd kaydı reddedilmiyor. Kontrat adındaki vade tarihi expiry_ms ile karşılaştırılmıyor. Sembol parse hatası 0 payoff'a çevrilip is_official_delivery=True dönüyor.
+Deneme: eth_usd, timestamp=1000, delivery=100000 kaydı ile BTC-27DEC24-90000-C için 0.1 BTC official sonuç üretildi. 'not-an-option' için 0.0 BTC official sonuç üretildi.
+Kabul koşulu: enstrüman türü, BTC/USD endeksi, vade tarihi ve resmi kaynak kaydı birlikte doğrulanmalı. Bozuk sembol sıfır kazanç/zarar değildir; açık hata olmalı. Aynı endeks/vade için çelişkili delivery kayıtları sessizce ezilmemeli.
+
+P1 / 6.2 — Tarihsel expiry'ye kadar delivery pagination yok.
+Yer: ingestion/settlement.py:275–299 ve :369.
+Provider eksik tarih için fetch_official_delivery_prices() çağırıyor; bu yalnız offset=0,count=100 tek sayfa. Helper offset kabul etse de provider istenen eski tarihe ulaşana kadar ilerlemiyor. Eski delivery kaydı yerelde önceden yoksa, daha eski sayfada bulunması halinde getirilemiyor.
+Kabul koşulu: expiry hedefli, limitli ve cache'li pagination; geçmiş expiry sonraki sayfada, gerçekten eksik kayıt, API hatası ve kesinti ayrı testler. 2024–2025 çalıştırılabilirliği yalnız son sayfa fetch'iyle kanıtlanamaz.
+
+P2 / 6.3 — Sayfa güncelleme tarihi ücret yürürlük tarihi olarak kullanılmış.
+Yer: ingestion/settlement.py:517–555; catalog/fees-btc-inverse.md.
+Resmi Fees sayfası 'Updated August 17, 2026 13:24' diyor. Kod bu tarihin 00:00 UTC anını confirmed başlangıcı yapıyor. Sayfanın güncellenme tarihi, ücret kuralının o saatte yürürlüğe girdiğinin ayrı kanıtı değildir; görev bunu özellikle ayırmayı istiyor.
+Kaynak: https://support.deribit.com/hc/en-us/articles/25944746248989-Fees (bu kontrolde okundu).
+Standart opsiyon/delivery oranları ve günlük opsiyon delivery muafiyeti güncel sayfayla uyumlu. Önceki yılları configured_unverified etiketlemek olumlu. Fakat confirmed geçerlilik aralığı için tarihsel yürürlük kanıtı ayrıca gerekir.
+Kabul koşulu: observed_at/source_updated_at/effective_at ayrılmalı; kanıtı olmayan yürürlük aralığı confirmed verilmemeli.
+
+P2 / 6.4 — Daily sınıflandırması ve parametre davranışı açıklığa kavuşmalı.
+Yer: ingestion/settlement.py:413–426 ve :501–502.
+is_daily_option yalnız kontrat ömrü <=36 saat kestirimini kullanıyor; sembolü kullanmıyor. Bu eşik resmi seri sınıfı kanıtı değil. Yeni listelenen strike ile expiry serisi birbirine karıştırılmamalı.
+FeeSchedule delivery_fee_rate_daily alanı kabul ediliyor fakat hesap doğrudan 0 döndürüyor. Deneme: günlük oran 0.001 yapılandırıldı, hesap 0.0 çıktı.
+Kabul koşulu: resmi seri metadata'sı veya belgeli sınıflandırma politikası; bilinmeyen sınıf açık unknown. Günlük oran zorunlu sıfırsa farklı değer reddedilmeli; yapılandırılabilir olacaksa alan hesapta kullanılmalı.
+
+P2 / 6.5 — Teslim yaması taşınabilir değil.
+Yer: reports/task-06/changes.patch:366 ve :927.
+İki yeni dosyanın diff yolları repo-relative yerine C:\Users\user\... mutlak Windows yolu içeriyor. Ayrıca catalog/fees-btc-inverse.md hunk'ı izole baseline'a uygulanmadı (metinde karakter kodlaması uyuşmazlığı görünümü var; kesin kök neden ayrıca düzeltilmeli).
+Gerçek sonuç: git apply hata verdi; test için manifestteki beş dosyanın ayrıca kopyalanması gerekti.
+Kabul koşulu: doğru baseline'dan repo-relative ve doğru UTF-8 patch yeniden üret; başka konumdaki temiz kopyada git apply --check, uygulama ve tam testleri geçir. Sadece yerel kaynakların doğru olması başka PC teslimi için yeterli değil.
+
+Ek statik kontrol: ingestion/deribit_underlying.py:393–408 merge yalnız timestamp ve OHLC farkına bakıyor; instrument/series kimliğini karşılaştırmıyor, sonlu sayı kontrolü yok. NaN karşılaştırmaları conflict'i atlayabilir. Negatif/NaN ve farklı seri testleri kabul matrisine eklenmeli. Bu ek başlık için bağımsız çalışma zamanı denemesi bu turda yapılmadı; statik bulgu olarak kaydedildi.
+
+Olumlu: inverse call/put formülleri, quantity/contract_size ve fee cap temel testleri geçti; resmi delivery yokken perpetual fiyatla ikame yapılmıyor; underlying proxy etiketi korunmuş.
+
+ÖNCELİK VE YENİDEN KABUL
+1. Önce önceki QC'deki Görev 1 ortak sözleşme sorunları çözülmeli; bağımlı teslimler revize sözleşmeye karşı tekrar denenmeli. Ajan raporlarının 'önceki görev kabul edildi' ifadesi ana orkestratör kabulü değildir.
+2. Görev 4: yanlış resume, sequence bütçe/kapsam/persistence, ekonomik hash.
+3. Görev 5: re-import, eksik arşiv güvenliği, metadata/conflict.
+4. Görev 6: settlement kimliği ve tarihsel pagination; fee kanıtı ve taşınabilir patch.
+5. Her bulgu için önce hatayı yakalayan regresyon testi ekle; sonra düzelt. Mevcut 140 testi de koru.
+6. Temiz farklı klasörde teslimleri uygula, tüm testleri çalıştır; görev sınırları içinde küçük gerçek veri smoke sonucunu offline testten ayrı raporla. Uzun dönem veri kapsamı ve uçtan uca strateji sonucu ayrı kabul aşamalarıdır.
+
+Bu rapor düzeltme uygulamaz. Görev 7 ve sonrasına kabul/reddet kararı içermez. Kaynak proje ve GitHub değiştirilmedi.

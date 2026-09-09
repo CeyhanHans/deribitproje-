@@ -1,0 +1,472 @@
+diff --git a/ingestion/contract_catalog.py b/ingestion/contract_catalog.py
+index 4a5ee59..e0cf5f0 100644
+--- a/ingestion/contract_catalog.py
++++ b/ingestion/contract_catalog.py
+@@ -107,22 +107,25 @@ class ContractSpec:
+     tick_size: float
+     contract_size: float
+     min_trade_amount: float
++    base_currency: str = "BTC"
++    quote_currency: str = "BTC"
++    counter_currency: str = "USD"
++    settlement_currency: str = "BTC"
+ 
+     def __post_init__(self) -> None:
+         if not self.instrument_name or not isinstance(self.instrument_name, str):
+             raise ContractCatalogError("instrument_name must be a non-empty string")
+-        _validate_date_consistency(
+-            self.instrument_name, self.expiration_timestamp, self.expiration_date_str
+-        )
+-        if isinstance(self.creation_timestamp, bool) or not isinstance(self.creation_timestamp, int):
+-            raise ContractCatalogError("creation_timestamp must be an integer")
+-        if isinstance(self.expiration_timestamp, bool) or not isinstance(self.expiration_timestamp, int):
+-            raise ContractCatalogError("expiration_timestamp must be an integer")
+-        if self.creation_timestamp >= self.expiration_timestamp:
++
++        parts = self.instrument_name.split("-")
++        if len(parts) != 4 or parts[0] != "BTC" or parts[3] not in {"C", "P"}:
++            raise ContractCatalogError(f"unsupported BTC inverse option name: {self.instrument_name}")
++
++        if not isinstance(self.underlying, str) or self.underlying != "BTC" or self.underlying != parts[0]:
+             raise ContractCatalogError(
+-                f"creation_timestamp ({self.creation_timestamp}) must precede "
+-                f"expiration_timestamp ({self.expiration_timestamp}) for '{self.instrument_name}'"
++                f"underlying '{self.underlying}' must match BTC and instrument name '{self.instrument_name}' (expected '{parts[0]}')"
+             )
++
++        name_strike = _parse_positive_float(parts[2], f"strike in {self.instrument_name}")
+         if (
+             isinstance(self.strike, bool)
+             or not isinstance(self.strike, (int, float))
+@@ -131,8 +134,35 @@ class ContractSpec:
+             or math.isinf(self.strike)
+         ):
+             raise ContractCatalogError(f"strike must be strictly positive number, got {self.strike}")
++        if abs(self.strike - name_strike) > 1e-4:
++            raise ContractCatalogError(
++                f"strike {self.strike} does not match strike in instrument name '{self.instrument_name}' ({name_strike})"
++            )
++
++        expected_type = "call" if parts[3] == "C" else "put"
+         if self.option_type not in ("call", "put"):
+             raise ContractCatalogError(f"option_type must be 'call' or 'put', got {self.option_type!r}")
++        if self.option_type != expected_type:
++            raise ContractCatalogError(
++                f"option_type '{self.option_type}' does not match instrument name suffix in '{self.instrument_name}' (expected '{expected_type}')"
++            )
++
++        _validate_date_consistency(
++            self.instrument_name, self.expiration_timestamp, self.expiration_date_str
++        )
++        if isinstance(self.creation_timestamp, bool) or not isinstance(self.creation_timestamp, int):
++            raise ContractCatalogError("creation_timestamp must be an integer")
++        if self.creation_timestamp < 0:
++            raise ContractCatalogError(
++                f"creation_timestamp must be non-negative, got {self.creation_timestamp}"
++            )
++        if isinstance(self.expiration_timestamp, bool) or not isinstance(self.expiration_timestamp, int):
++            raise ContractCatalogError("expiration_timestamp must be an integer")
++        if self.creation_timestamp >= self.expiration_timestamp:
++            raise ContractCatalogError(
++                f"creation_timestamp ({self.creation_timestamp}) must precede "
++                f"expiration_timestamp ({self.expiration_timestamp}) for '{self.instrument_name}'"
++            )
+         if (
+             isinstance(self.tick_size, bool)
+             or not isinstance(self.tick_size, (int, float))
+@@ -159,6 +189,15 @@ class ContractSpec:
+             raise ContractCatalogError(
+                 f"min_trade_amount must be strictly positive number, got {self.min_trade_amount}"
+             )
++        if self.base_currency != "BTC":
++            raise ContractCatalogError(f"base_currency must be 'BTC', got '{self.base_currency}'")
++        if self.quote_currency != "BTC":
++            raise ContractCatalogError(f"quote_currency must be 'BTC', got '{self.quote_currency}'")
++        if self.counter_currency != "USD":
++            raise ContractCatalogError(f"counter_currency must be 'USD', got '{self.counter_currency}'")
++        if self.settlement_currency != "BTC":
++            raise ContractCatalogError(f"settlement_currency must be 'BTC', got '{self.settlement_currency}'")
++
+ 
+ 
+ @dataclass(frozen=True)
+@@ -429,20 +468,45 @@ def _parse_contract(row: Mapping[str, Any]) -> ContractSpec:
+ 
+     # Base and settlement currency consistency
+     base_curr = row.get("base_currency") or row.get("underlying")
+-    if base_curr is not None and str(base_curr).upper() != "BTC":
++    if base_curr is not None and str(base_curr).strip().upper() != "BTC":
+         raise ContractCatalogError(f"base_currency must be 'BTC' for BTC inverse options, got '{base_curr}'")
+ 
+     settle_curr = row.get("settlement_currency")
+-    if settle_curr is not None and str(settle_curr).upper() != "BTC":
++    if settle_curr is not None and str(settle_curr).strip().upper() != "BTC":
+         raise ContractCatalogError(f"settlement_currency must be 'BTC', got '{settle_curr}'")
+ 
+     quote_curr = row.get("quote_currency")
+-    if quote_curr is not None and str(quote_curr).upper() not in {"BTC", "USD"}:
+-        raise ContractCatalogError(f"quote_currency must be 'BTC' or 'USD', got '{quote_curr}'")
+-
+     counter_curr = row.get("counter_currency")
+-    if counter_curr is not None and str(counter_curr).upper() not in {"USD", "BTC"}:
+-        raise ContractCatalogError(f"counter_currency must be 'USD' or 'BTC', got '{counter_curr}'")
++
++    # Strict Deribit BTC inverse currency validation (canonical: quote=BTC, counter=USD)
++    if quote_curr is not None and counter_curr is not None:
++        q = str(quote_curr).strip().upper()
++        c = str(counter_curr).strip().upper()
++        if (q, c) == ("USD", "BTC"):
++            raise ContractCatalogError(
++                f"invalid currency combination for BTC inverse option (inverted): quote='{quote_curr}', counter='{counter_curr}' "
++                f"(expected canonical quote='BTC', counter='USD')"
++            )
++        if q != "BTC":
++            raise ContractCatalogError(
++                f"quote_currency must be 'BTC' for BTC inverse options, got '{quote_curr}'"
++            )
++        if c != "USD":
++            raise ContractCatalogError(
++                f"counter_currency must be 'USD' for BTC inverse options, got '{counter_curr}'"
++            )
++    elif quote_curr is not None:
++        q = str(quote_curr).strip().upper()
++        if q != "BTC":
++            raise ContractCatalogError(
++                f"quote_currency must be 'BTC' for BTC inverse options, got '{quote_curr}'"
++            )
++    elif counter_curr is not None:
++        c = str(counter_curr).strip().upper()
++        if c != "USD":
++            raise ContractCatalogError(
++                f"counter_currency must be 'USD' for BTC inverse options, got '{counter_curr}'"
++            )
+ 
+     created = _required_int(row, "creation_timestamp")
+     expiry = _required_int(row, "expiration_timestamp")
+@@ -476,6 +540,10 @@ def _parse_contract(row: Mapping[str, Any]) -> ContractSpec:
+         tick_size=tick_size,
+         contract_size=contract_size,
+         min_trade_amount=min_trade_amount,
++        base_currency="BTC",
++        quote_currency="BTC",
++        counter_currency="USD",
++        settlement_currency="BTC",
+     )
+ 
+ 
+diff --git a/tests/test_contract_catalog.py b/tests/test_contract_catalog.py
+index baeb131..468debf 100644
+--- a/tests/test_contract_catalog.py
++++ b/tests/test_contract_catalog.py
+@@ -23,6 +23,113 @@ EXPIRY_10D = 1_735_286_400_000  # 2024-12-27 08:00:00 UTC (NOW + 10 * DAY)
+ EXPIRY_17D = 1_735_891_200_000  # 2025-01-03 08:00:00 UTC (NOW + 17 * DAY)
+ EXPIRY_100D = 1_743_062_400_000  # 2025-03-27 08:00:00 UTC (NOW + 100 * DAY)
+ 
++REAL_DERIBIT_PILOT_SAMPLES = [
++    {
++        "tick_size_steps": [],
++        "tick_size": 0.0001,
++        "taker_commission": 0.0001,
++        "strike": 600.0,
++        "settlement_period": "week",
++        "settlement_currency": "BTC",
++        "rfq": False,
++        "quote_currency": "BTC",
++        "price_index": "btc_usd",
++        "option_type": "call",
++        "min_trade_amount": 0.01,
++        "maker_commission": 0.0,
++        "kind": "option",
++        "is_active": False,
++        "instrument_name": "BTC-15JUL16-600-C",
++        "instrument_id": 70492,
++        "expiration_timestamp": 1468594800000,
++        "creation_timestamp": 1468453919000,
++        "counter_currency": "USD",
++        "contract_size": 1.0,
++        "block_trade_tick_size": 0.0001,
++        "block_trade_min_trade_amount": 50,
++        "block_trade_commission": 0.00015,
++        "base_currency": "BTC",
++    },
++    {
++        "tick_size_steps": [],
++        "tick_size": 0.0001,
++        "taker_commission": 0.0001,
++        "strike": 600.0,
++        "settlement_period": "week",
++        "settlement_currency": "BTC",
++        "rfq": False,
++        "quote_currency": "BTC",
++        "price_index": "btc_usd",
++        "option_type": "put",
++        "min_trade_amount": 0.01,
++        "maker_commission": 0.0,
++        "kind": "option",
++        "is_active": False,
++        "instrument_name": "BTC-15JUL16-600-P",
++        "instrument_id": 156989,
++        "expiration_timestamp": 1468594800000,
++        "creation_timestamp": 1468453919000,
++        "counter_currency": "USD",
++        "contract_size": 1.0,
++        "block_trade_tick_size": 0.0001,
++        "block_trade_min_trade_amount": 50,
++        "block_trade_commission": 0.00015,
++        "base_currency": "BTC",
++    },
++    {
++        "tick_size_steps": [],
++        "tick_size": 0.0001,
++        "taker_commission": 0.0001,
++        "strike": 610.0,
++        "settlement_period": "week",
++        "settlement_currency": "BTC",
++        "rfq": False,
++        "quote_currency": "BTC",
++        "price_index": "btc_usd",
++        "option_type": "call",
++        "min_trade_amount": 0.01,
++        "maker_commission": 0.0,
++        "kind": "option",
++        "is_active": False,
++        "instrument_name": "BTC-15JUL16-610-C",
++        "instrument_id": 152809,
++        "expiration_timestamp": 1468594800000,
++        "creation_timestamp": 1468431059000,
++        "counter_currency": "USD",
++        "contract_size": 1.0,
++        "block_trade_tick_size": 0.0001,
++        "block_trade_min_trade_amount": 50,
++        "block_trade_commission": 0.00015,
++        "base_currency": "BTC",
++    },
++    {
++        "tick_size_steps": [],
++        "tick_size": 0.0001,
++        "taker_commission": 0.0001,
++        "strike": 610.0,
++        "settlement_period": "week",
++        "settlement_currency": "BTC",
++        "rfq": False,
++        "quote_currency": "BTC",
++        "price_index": "btc_usd",
++        "option_type": "put",
++        "min_trade_amount": 0.01,
++        "maker_commission": 0.0,
++        "kind": "option",
++        "is_active": False,
++        "instrument_name": "BTC-15JUL16-610-P",
++        "instrument_id": 152810,
++        "expiration_timestamp": 1468594800000,
++        "creation_timestamp": 1468431059000,
++        "counter_currency": "USD",
++        "contract_size": 1.0,
++        "block_trade_tick_size": 0.0001,
++        "block_trade_min_trade_amount": 50,
++        "block_trade_commission": 0.00015,
++        "base_currency": "BTC",
++    },
++]
++
+ 
+ def row(name: str, expiry: int | None = None, created: int | None = None, **extra) -> dict:
+     parts = name.split("-")
+@@ -46,7 +153,8 @@ def row(name: str, expiry: int | None = None, created: int | None = None, **extr
+         "instrument_name": name,
+         "base_currency": "BTC",
+         "settlement_currency": "BTC",
+-        "quote_currency": "USD",
++        "quote_currency": "BTC",
++        "counter_currency": "USD",
+         "strike": float(parts[2]),
+         "option_type": "call" if parts[3] == "C" else "put",
+         "expiration_timestamp": expiry,
+@@ -262,10 +370,11 @@ class ContractCatalogTests(unittest.TestCase):
+     def test_real_deribit_pilot_sample_records_parsed_successfully(self):
+         """Real Deribit records with quote_currency='BTC' and counter_currency='USD' must parse cleanly."""
+         pilot_file = Path("reports/pilot/catalog_sample.json")
+-        if not pilot_file.exists():
+-            self.skipTest("pilot file not found")
+-        data = json.loads(pilot_file.read_text(encoding="utf-8"))
+-        samples = data.get("sample_records", [])
++        if pilot_file.exists():
++            data = json.loads(pilot_file.read_text(encoding="utf-8"))
++            samples = data.get("sample_records", [])
++        else:
++            samples = REAL_DERIBIT_PILOT_SAMPLES
+         self.assertGreater(len(samples), 0)
+ 
+         parsed_specs = [_parse_contract(r) for r in samples]
+@@ -279,6 +388,10 @@ class ContractCatalogTests(unittest.TestCase):
+         self.assertEqual(first.expiration_date_str, "15JUL16")
+         self.assertEqual(first.contract_size, 1.0)
+         self.assertEqual(first.tick_size, 0.0001)
++        self.assertEqual(first.base_currency, "BTC")
++        self.assertEqual(first.quote_currency, "BTC")
++        self.assertEqual(first.counter_currency, "USD")
++        self.assertEqual(first.settlement_currency, "BTC")
+ 
+     def test_direct_contract_spec_constructor_validates_dates_and_numerics(self):
+         """Direct ContractSpec instantiation must run full validation."""
+@@ -429,6 +542,160 @@ class ContractCatalogTests(unittest.TestCase):
+         # Verify peak memory is reasonable (< 300MB)
+         self.assertLess(peak_mem / (1024 * 1024), 300.0)
+ 
++    # =========================================================================
++    # QC G3-A & G3-B Specific Verification Tests
++    # =========================================================================
++
++    def test_contract_spec_constructor_and_replace_rejection_g3_a(self):
++        """QC G3-A: Enforce identical validation in ContractSpec constructor and dataclasses.replace.
++
++        Must reject:
++        - Inconsistent strike (name says 90000, strike=1.0)
++        - Inconsistent option_type (name ends with C, option_type='put')
++        - Inconsistent underlying (underlying='ETH')
++        - Negative creation_timestamp (creation_timestamp=-1)
++        """
++        import dataclasses
++
++        valid_spec = ContractSpec(
++            instrument_name="BTC-27DEC24-90000-C",
++            underlying="BTC",
++            strike=90000.0,
++            option_type="call",
++            expiration_timestamp=EXPIRY_10D,
++            expiration_date_str="27DEC24",
++            creation_timestamp=NOW - DAY,
++            is_active=False,
++            tick_size=0.0005,
++            contract_size=1.0,
++            min_trade_amount=0.1,
++        )
++
++        # 1. Mismatched strike
++        with self.assertRaisesRegex(ContractCatalogError, "strike .* does not match"):
++            ContractSpec(
++                instrument_name="BTC-27DEC24-90000-C",
++                underlying="BTC",
++                strike=1.0,
++                option_type="call",
++                expiration_timestamp=EXPIRY_10D,
++                expiration_date_str="27DEC24",
++                creation_timestamp=NOW - DAY,
++                is_active=False,
++                tick_size=0.0005,
++                contract_size=1.0,
++                min_trade_amount=0.1,
++            )
++        with self.assertRaisesRegex(ContractCatalogError, "strike .* does not match"):
++            dataclasses.replace(valid_spec, strike=1.0)
++
++        # 2. Mismatched option_type
++        with self.assertRaisesRegex(ContractCatalogError, "option_type .* does not match"):
++            ContractSpec(
++                instrument_name="BTC-27DEC24-90000-C",
++                underlying="BTC",
++                strike=90000.0,
++                option_type="put",
++                expiration_timestamp=EXPIRY_10D,
++                expiration_date_str="27DEC24",
++                creation_timestamp=NOW - DAY,
++                is_active=False,
++                tick_size=0.0005,
++                contract_size=1.0,
++                min_trade_amount=0.1,
++            )
++        with self.assertRaisesRegex(ContractCatalogError, "option_type .* does not match"):
++            dataclasses.replace(valid_spec, option_type="put")
++
++        # 3. Non-BTC underlying
++        with self.assertRaisesRegex(ContractCatalogError, "underlying .* must match"):
++            ContractSpec(
++                instrument_name="BTC-27DEC24-90000-C",
++                underlying="ETH",
++                strike=90000.0,
++                option_type="call",
++                expiration_timestamp=EXPIRY_10D,
++                expiration_date_str="27DEC24",
++                creation_timestamp=NOW - DAY,
++                is_active=False,
++                tick_size=0.0005,
++                contract_size=1.0,
++                min_trade_amount=0.1,
++            )
++        with self.assertRaisesRegex(ContractCatalogError, "underlying .* must match"):
++            dataclasses.replace(valid_spec, underlying="ETH")
++
++        # 4. Negative creation timestamp
++        with self.assertRaisesRegex(ContractCatalogError, "creation_timestamp must be non-negative"):
++            ContractSpec(
++                instrument_name="BTC-27DEC24-90000-C",
++                underlying="BTC",
++                strike=90000.0,
++                option_type="call",
++                expiration_timestamp=EXPIRY_10D,
++                expiration_date_str="27DEC24",
++                creation_timestamp=-1,
++                is_active=False,
++                tick_size=0.0005,
++                contract_size=1.0,
++                min_trade_amount=0.1,
++            )
++        with self.assertRaisesRegex(ContractCatalogError, "creation_timestamp must be non-negative"):
++            dataclasses.replace(valid_spec, creation_timestamp=-1)
++
++    def test_strict_currency_validation_and_rejection_g3_b(self):
++        """QC G3-B: Strict currency pairs (base=BTC, quote=BTC, counter=USD, settlement=BTC).
++
++        Must reject:
++        - Inverted quote=USD, counter=BTC
++        - Non-BTC quote currency
++        - Non-USD counter currency
++        - Inconsistent currencies in ContractSpec constructor
++        """
++        # 1. Inverted quote=USD, counter=BTC rejected in parser
++        with self.assertRaisesRegex(ContractCatalogError, "invalid currency combination"):
++            catalog([row("BTC-27DEC24-90000-C", quote_currency="USD", counter_currency="BTC")])
++
++        # 2. Non-BTC quote currency
++        with self.assertRaisesRegex(ContractCatalogError, "quote_currency must be 'BTC'"):
++            catalog([row("BTC-27DEC24-90000-C", quote_currency="EUR", counter_currency="USD")])
++
++        # 3. Non-USD counter currency
++        with self.assertRaisesRegex(ContractCatalogError, "counter_currency must be 'USD'"):
++            catalog([row("BTC-27DEC24-90000-C", quote_currency="BTC", counter_currency="EUR")])
++
++        # 4. In ContractSpec directly
++        with self.assertRaisesRegex(ContractCatalogError, "quote_currency must be 'BTC'"):
++            ContractSpec(
++                instrument_name="BTC-27DEC24-90000-C",
++                underlying="BTC",
++                strike=90000.0,
++                option_type="call",
++                expiration_timestamp=EXPIRY_10D,
++                expiration_date_str="27DEC24",
++                creation_timestamp=NOW - DAY,
++                is_active=False,
++                tick_size=0.0005,
++                contract_size=1.0,
++                min_trade_amount=0.1,
++                quote_currency="USD",
++            )
++        with self.assertRaisesRegex(ContractCatalogError, "counter_currency must be 'USD'"):
++            ContractSpec(
++                instrument_name="BTC-27DEC24-90000-C",
++                underlying="BTC",
++                strike=90000.0,
++                option_type="call",
++                expiration_timestamp=EXPIRY_10D,
++                expiration_date_str="27DEC24",
++                creation_timestamp=NOW - DAY,
++                is_active=False,
++                tick_size=0.0005,
++                contract_size=1.0,
++                min_trade_amount=0.1,
++                counter_currency="BTC",
++            )
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
