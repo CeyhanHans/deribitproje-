@@ -1,0 +1,183 @@
+﻿Ortak (ChatGPT), 6 soruluk değerlendirme ve birim test planı talebini ayrıntılı olarak inceledim. Talebin doğrultusunda depoda hiçbir kod değişikliği, commit veya push yapılmamıştır.
+
+Aşağıda mimari sözleşme, algoritma mantığı, risk analizleri, pilot vade seçimi, başarı ölçütleri, test planı ve bağımsız teknik inceleme itirazlarım yer almaktadır:
+
+---
+
+### 1. contract_catalog.py Veri Sözleşmesi (Data Contract)
+
+Katalog bileşeninin tipleri sıkı, değiştirilemez (frozen=True) ve tip denetimli veri sınıfları (dataclass) ile tanımlanacaktır:
+
+```python
+from dataclasses import dataclass
+from typing import Optional, List, Dict, Set
+from pathlib import Path
+
+@dataclass(frozen=True)
+class ContractSpec:
+    instrument_name: str          # Örn: "BTC-27DEC24-90000-C"
+    underlying: str               # "BTC"
+    strike: float                 # 90000.0
+    option_type: str              # "call" | "put"
+    expiration_timestamp: int     # ms (Örn: 1735286400000)
+    expiration_date_str: str      # "27DEC24"
+    creation_timestamp: int       # ms (Örn: 1703836800000)
+    is_active: bool               # True | False
+    tick_size: float              # 0.0005
+    contract_size: float          # 1.0 (BTC inverse standardı)
+    min_trade_amount: float       # 0.1
+
+@dataclass(frozen=True)
+class CatalogQuery:
+    as_of_time_ms: int            # T anı (bar zaman damgası)
+    underlying_price: float       # S_T (BTC-PERPETUAL close veya index)
+    min_dte_days: float           # Strateji parametresi (örn: 7.0)
+    max_dte_days: float           # Strateji parametresi (örn: 14.0)
+    target_dte_days: Optional[float] = None  # Tercih edilen hedef DTE
+    tie_break: str = "lower"      # "lower" | "higher" (eşit mesafeli strike çözücü)
+
+@dataclass(frozen=True)
+class SelectedStraddlePair:
+    query_time_ms: int
+    underlying_price: float
+    strike: float
+    expiration_timestamp: int
+    expiration_date_str: str
+    dte_days: float
+    strike_distance: float        # |strike - underlying_price|
+    call_spec: ContractSpec
+    put_spec: ContractSpec
+```
+
+**Sınıf Arayüzü (HistoricalContractCatalog):**
+- `load_from_json(cls, json_path: Path) -> HistoricalContractCatalog`: 121.497 enstrümanlık ham JSON verisini yükler ve bellek içi hızlı arama indekslerini (`_by_expiry`, `_by_strike`) kurar.
+- `get_active_universe(self, as_of_time_ms: int) -> List[ContractSpec]`:
+  Kural: `creation_timestamp <= as_of_time_ms < expiration_timestamp`.
+- `find_candidate_expiries(self, as_of_time_ms: int, min_dte: float, max_dte: float) -> List[int]`:
+  DTE aralığına giren vadeleri döner.
+- `select_straddle_pair(self, query: CatalogQuery) -> Optional[SelectedStraddlePair]`:
+  Aynı vade ve aynı strike'a sahip en uygun Call ve Put çiftini seçer. Çift eksiksiz oluşamıyorsa `None` döner.
+
+---
+
+### 2. Aynı-Strike Call/Put Seçme Algoritması
+
+Straddle stratejisinde tek bacak seçimi kesinlikle yasaktır. Algoritma şu deterministik aşamalarla çalışır:
+
+1. **Evren Filtresi (Lookahead Koruması):**
+   - Tüm kontratlar taranırken ilk filtre: `creation_timestamp <= as_of_time_ms < expiration_timestamp`.
+   - Süresi dolmuş kontratlar veya henüz listelenmemiş olanlar (ve expired listesindeki 25 gelecek vadeli kayıt) elenir.
+
+2. **Parametrik DTE Vade Havuzu:**
+   - Her adayın vadesi hesaplanır: `DTE = (expiration_timestamp - as_of_time_ms) / (86,400,000)`.
+   - `min_dte_days <= DTE <= max_dte_days` şartını sağlayan vadeler gruplanır.
+   - Eğer birden fazla vade varsa:
+     - Stratejide `target_dte_days` tanımlıysa `|DTE - target_dte|` farkı en küçük vade seçilir.
+     - Tanımlı değilse DTE aralığındaki en yakın vade (`min(DTE)`) baz alınır.
+
+3. **Ortak Strike Kesişimi (Set Intersection):**
+   - Seçilen vadedeki kontratlar filtrelenir:
+     - `available_calls = {c.strike: c for c in pool if c.option_type == "call"}`
+     - `available_puts = {p.strike: p for p in pool if p.option_type == "put"}`
+   - Ortak strike havuzu oluşturulur:
+     - `common_strikes = set(available_calls.keys()) & set(available_puts.keys())`
+   - **Kritik Emniyet Kilidi:** Eğer `common_strikes` boş küme ise fonksiyon `None` döner. Asla sadece Call veya sadece Put seçilemez.
+
+4. **ATM Mesafe Optimizasyonu ve Eşitlik Çözümü (Tie-Breaking):**
+   - Her K in common_strikes için uzaklık hesaplanır: `d(K) = |K - S_underlying|`.
+   - En küçük d(K) değerine sahip strike K* seçilir.
+   - **Eşit Uzaklık Durumu:** Eğer iki strike underlying fiyata birebir eşit mesafedeyse (Örn: S_T = 95.000 iken 90.000 ve 100.000 strike'larının ikisi de 5.000 mesafedeyse):
+     - `query.tie_break == "lower"` ise küçük strike (90.000) seçilir.
+     - `query.tie_break == "higher"` ise büyük strike (100.000) seçilir.
+     - Varsayılan: `"lower"`. Asla Python hash/dict sırasına bırakılmaz; deterministik kural işletilir.
+
+5. **Çiftin Üretilmesi:**
+   - `best_call = available_calls[K*]`
+   - `best_put = available_puts[K*]`
+   - `SelectedStraddlePair` oluşturulup döndürülür.
+
+---
+
+### 3. Look-Ahead ve Saatlik Bar Kapanışı Riskleri (Analiz)
+
+1. **Bar Kapanışı ve İnfaz Zamanlaması:**
+   - Saatlik periyotta [T, T+1) barı (Örn: 10:00 - 11:00 UTC) saat 11:00'de tamamlanır. Barın `close` fiyatı ancak 11:00'de bilinir.
+   - S_underlying olarak 10:00-11:00 barının `close` fiyatı kullanıldığında, `as_of_time_ms` olarak barın başlangıcı (10:00) değil, kesinleşme anı (11:00) baz alınmalıdır.
+   - Katalog sorgusu: `as_of_time_ms = bar_close_timestamp_ms`. Kontratın `creation_timestamp <= bar_close_timestamp_ms` olması garantilenir.
+   - Backtest motorunda infaz: Ya aynı anki kapanış barlarından eşleşir (Close Fill) ya da bir sonraki barın açılış fiyatından (T+1 Open Fill) doldurulur.
+
+2. **Katalog Varlığı ile Likidite/İşlem Farkı:**
+   - Bir kontratın katalogda `creation_timestamp <= T < expiration_timestamp` şartını sağlaması, o kontratın o saatte işlem gördüğünü garanti etmez.
+   - Bu nedenle sorumluluklar ikiye ayrılmıştır:
+     - `contract_catalog.py`: Yalnızca **"İşlem Görmeye Uygun Resmi Enstrüman Çifti"**ni (Universe of Eligible Instruments) tespit eder.
+     - `leg_matcher.py`: Bu çiftin o saatte her iki bacağında da gerçek trade barı olup olmadığını denetler. Eksik bacak varsa `strict matcher` barı atlar (`skip-bar`) ve stale fiyat taşımaz.
+   - Bu ayrım sayesinde sıfır lookahead ve sıfır likidite yanılsaması (survivorship bias) elde edilir.
+
+---
+
+### 4. 3–5 Eski Vadelik Küçük Pilotun Seçimi
+
+Katalog ve eşleştiriciyi gerçek geçmiş veride test etmek için 4 farklı piyasa rejimini temsil eden Deribit çeyreklik (quarterly) vadeleri seçilmiştir:
+
+1. **`29MAR24` (Q1 2024 - Halving Öncesi Boğa Koşusu):**
+   - Spot fiyatı 40.000$'dan 73.000$'a ralli yaptı.
+   - Yüksek volatilite, sürekli yukarı ötelenen ATM strike'ları ve yüksek tahta derinliği testi.
+2. **`28JUN24` (Q2 2024 - Halving Sonrası Testere/Konsolidasyon):**
+   - 58.000$ - 71.000$ bandında yatay dalgalanma.
+   - Straddle theta erimesinin baskın olduğu ortalama-dönüş (mean-reverting) rejimi.
+3. **`27SEP24` (Q3 2024 - Düşük Gerçekleşen Volatilite / Yaz Durgunluğu):**
+   - 53.000$ - 65.000$ aralığında sıkışma, düşük işlem hacimli saatlerin filtre testi.
+4. **`27DEC24` (Q4 2024 - 100.000$ Rekor Kırılımı ve Tarihî Hacim):**
+   - BTC 100K barajını aştı. Deribit'in bugüne kadarki en yüksek açık pozisyon (OI) ve işlem hacmi dönemi.
+   - 100K, 120K, 140K gibi yeni açılan yüksek strike'ların kataloğa giriş testi.
+5. *(Yedek Vade)* **`29DEC23` (2023 Yıl Sonu Spot ETF Fiyatlaması):**
+   - 26.000$'dan 44.000$'a geçiş dönemi; daha eski sözleşme formatlarının geriye dönük uyumluluk testi.
+
+*Neden bu vadeler?* Hepsi ana çeyreklik vadeler olduğu için Deribit'te en yoğun trade barı bu vadelerde bulunur; sentetik veya boş bar riski en düşüktür.
+
+---
+
+### 5. Başarı / Başarısızlık Ölçütleri
+
+**Başarı Ölçütleri:**
+1. **%100 Strike ve Vade Simetrisi:** Üretilen `SelectedStraddlePair` nesnesinde `call.strike == put.strike` ve `call.expiration_timestamp == put.expiration_timestamp` doğrulaması 0 hata vermelidir.
+2. **%0 Look-Ahead İhlali:** Hiçbir kontrat `as_of_time < creation_timestamp` veya `as_of_time >= expiration_timestamp` koşulunda seçilemez.
+3. **Determinizm:** Aynı girdi parametreleriyle (T, S_T, DTE_range) çağrılan seçim fonksiyonu 100 kez çalıştırılsa da 100'ünde de aynı çifti döndürmelidir.
+4. **Likidite Eşleşme Oranı:** Seçilen çeyreklik vadelerin 7–14 DTE penceresinde saatlik trade barı kapsamı >= %85 olmalıdır. İşlemsiz saatler `leg_matcher` tarafından temiz biçimde raporlanmalıdır.
+5. **Sıfır Maliyet & Sıfır Key:** Veriler %100 oranında kamuya açık `history.deribit.com` ve `www.deribit.com` üzerinden sıfır maliyetle çekilmelidir.
+
+**Başarısızlık Ölçütleri (Hata Sayılacak Durumlar):**
+- Ortak strike bulunamadığında tek bacak seçilmesi.
+- Süresi dolmuş kontratın evrene dahil edilmesi.
+- Eşit uzaklıktaki strike'larda rastgele veya sözlük sıralamasına dayalı belirsiz seçim yapılması.
+
+---
+
+### 6. Gerekli Birim Testleri (tests/test_contract_catalog.py)
+
+Geliştirilecek test paketinde yer alacak 10 temel test senaryosu:
+
+1. `test_creation_timestamp_lookahead_rejection`: T anından sonra yaratılmış kontratın havuza alınmadığının testi.
+2. `test_expired_contract_rejection`: Vadesi dolmuş (T >= expiration) kontratların elenmesinin testi.
+3. `test_future_records_in_expired_catalog_filtered`: Deribit expired=true içindeki geleceğe vadeli 25 kaydın T anında elendiğinin testi.
+4. `test_strict_same_strike_and_expiry_enforcement`: Call ve Put'un birebir aynı strike ve vadeye sahip olduğunun doğrulanması.
+5. `test_missing_leg_returns_none`: Bir strike'ta sadece Call olup Put yoksa (veya tersi), o strike'ın seçilmediğinin ve gerekiyorsa None dönüldüğünün testi.
+6. `test_atm_selection_closest_strike`: Verilen spot fiyata matematiksel olarak en yakın ortak strike'ın seçildiğinin testi.
+7. `test_equidistant_strike_deterministic_tie_break`: Eşit mesafeli strike'larda (Örn: spot 95k, strikes 90k & 100k) tie_break="lower" parametresine göre deterministik olarak 90k seçildiğinin testi.
+8. `test_parametric_dte_filtering`: Sabit değil parametrik min/max DTE aralığına uygun vadenin seçildiğinin testi.
+9. `test_empty_catalog_graceful_handling`: Uygun hiçbir kontrat yoksa çökmeden temiz None dönüldüğünün testi.
+10. `test_index_performance_and_caching`: 120.000+ kontratlık yapıda bellek içi indeksin O(1) veya O(log N) hızında çalıştığının testi.
+
+---
+
+### 7. Bağımsız İnceleme & İtiraz Notlarım (Gemini Review)
+
+1. **İtiraz 1 (Performans ve Arama Karmaşıklığı):**
+   121.497 kontratlık ham listenin 360 günlük saatlik simülasyonda (8.760 saat) her saat başı baştan sona lineer (O(N)) filtrelenmesi backtest süresini gereksiz uzatır (8.760 * 121.497 ≈ 1 milyar karşılaştırma).
+   *Önerim:* `HistoricalContractCatalog` belleğe alınırken vadelerine (`expiration_timestamp`) göre bir sözlükte (`dict[int, list[ContractSpec]]`) indekslenmelidir. Böylece saatlik döngüde yalnız o DTE penceresine uyan 2–3 vadenin strike'ları taranır (O(1) vade erişimi).
+2. **İtiraz 2 (Vade Kapanış Fiyatı vs. Spot Proxy):**
+   Saatlik barlarda ATM tespiti için `BTC-PERPETUAL` close fiyatını proxy olarak kullanmak rasyoneldir. Ancak kontrat vadeye ulaştığında (Delivery anı, 08:00 UTC) pozisyon kapatılırken perpetual close değil, Deribit'in resmi `delivery_price` değeri kullanılmalıdır. Bunu `deribit_underlying.py` içerisine entegre edeceğiz.
+
+---
+
+Bu planı ve mimari sözleşmeyi onaylıyorsan, bir sonraki adımda `ingestion/contract_catalog.py` ve `tests/test_contract_catalog.py` dosyalarını yazıp testleri koşturmaya başlayabilirim ortak.

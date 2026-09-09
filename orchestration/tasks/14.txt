@@ -1,0 +1,67 @@
+GÖREV 14 — Veri pilotu ve kaynak yeterlilik kapısı
+
+BU MESAJ UYGULAMA EMRİDİR. Yalnız bu görevi tamamla.
+ÖNKOŞUL: Görev 1 kabul edilmiş olmalı; Görev 3 kabul edilmiş olmalı; Görev 4 kabul edilmiş olmalı; Görev 5 kabul edilmiş olmalı; Görev 6 kabul edilmiş olmalı; Görev 7 kabul edilmiş olmalı.
+YAZMA SINIRI (proje köküne göre): research/pilot.py; tests/test_pilot.py; reports/pilot/**.
+Ek izin: reports/task-14/**.
+Diğer kaynak dosyaları salt okunurdur.
+
+YAPILACAKLAR
+Resmi history katalog örneğini hash/capture ile indir; önceki 121497/25 sayılarını güncel sabit kabul etme. 29DEC23,29MAR24,28JUN24,27SEP24,27DEC24 vadelerinde expiry-14d ve expiry-7d arasını incele. Seçimler her değerlendirme anında o anda bilinen underlying'den; 3/9 henüz yoksa pilotun metadata seçimi 3 API'siyle. Toplam 5000 request, 1 GiB ve 60 dakika üst sınırı; her biri configurable ve aşımda incomplete. Güncel resmi rate limit doğrulanır; bounded serial fetch. Her expiry ve bacakta no-trade/download gap ayrımı. Ayrıca algoritmanın seçtiği en az bir quarterly olmayan vade örneğini raporla; quarterly yoğunluğu tüm yıla genellenmesin. %85 sadece hedef gösterge, veri doldurma/sonucu güzelleştirme gerekçesi değildir.
+
+KESİN KABUL TESTLERİ
+Her iddia ham veri manifestine bağlanır; request cap incomplete testi; sıfır trade geçerli yanıt hatadan ayrılır; 2023 gerçek veri örneği. Sonuç READY/PARTIAL/BLOCKED ve neden. Bu görev strateji kârlılığı kanıtlamaz.
+
+BİTİRME ŞARTI
+Üstteki her maddede uygulama ve test kanıtı göster. Eksik madde varsa READY_FOR_REVIEW yerine PARTIAL/BLOCKED ve eksik nedenini ver. Sonraki görevi başlatma.
+
+ORTAK EMİR VE MİMARİ — SÜRÜM 1, 2026-09-09
+Proje: C:\Users\user\Documents\Codex\2026-09-08\tes\deribit-options-backtest-catalog
+Orkestratör: bu ana Codex görevi. Kullanıcı görevleri dış ajanlara elle gönderir. Alt ajan başlatma, başka modele danışma. Tek görevi uygula; bütün projeyi üstlenme.
+
+ÜRÜN HEDEFİ
+Kullanıcı başlangıç/bitiş tarihi, strateji bacakları, vade/strike, giriş/çıkış, sermaye ve maliyetleri seçer. Gerçek tarihsel BTC inverse opsiyon verisiyle dönem boyunca tekrarlanan işlemler simüle edilir; işlem bazında ve portföy bazında kazanma/kaybetme, net PnL, drawdown ve veri kapsamı raporlanır. 2024 Mart–2025 Mayıs ve long straddle yalnız örnektir. 30/60/90/120/360 gün kısayoldur, ürün sınırı değildir. İlk sürüm 1h/1d karar çözünürlüğü; saniyelik/diğer ürünler ileri uzantıdır.
+
+BAŞLANGIÇ VE SAHİPLİK
+1. Kendi çalışma kopyandaki AGENTS.md, README, REQUIRED ve bu görevin dosyalarını oku. Kaynağa erişemiyorsan uygulama yapılmış gibi rapor verme.
+2. Başlangıç HEAD ea62db2439f801de7ef247ffe3b6047f4dec33fa; katalog modülü ve testi başlangıçta untracked. Bunlar korunmalı ve paketlenmeli. Yalnız commit'ten klon eksik başlangıçtır.
+3. Önkoşulların ana orkestratörce kabul edilmiş teslimlerini içeren kopyayla başla. Henüz tamamlanmamış bağımlılığı tahmini mock API ile ikame edip entegrasyon tamamlandı deme. Test doubles yalnız kilitli Protocol'e uyar.
+4. Görev1'den sonra specs/contracts-v1.md ve core/contracts.py salt okunur. Eksik arayüz için reports/task-NN/contract-request.md yaz: gereken imza, çağıran modüller ve etki. Orkestratör sözleşmeyi revize etmeden kendi kopyanı değiştirme.
+5. Yalnız izin verilen dosyaları ve reports/task-NN/** teslim dosyalarını değiştir. Ortak __init__, requirements, README veya başka ajanın testlerini kendiliğinden değiştirme. Gerekli paket __init__ dosyaları yalnız kendi sahip olduğun yeni dizinde açılabilir.
+6. Ayrı çalışma kopyası/branch kullan. Ana kaynakta eşzamanlı edit yok. Kullanıcının mevcut değişikliklerini koru; reset/clean yok. Push/PR/yayın ve ücretli veri satın alma bu uygulama görevinin parçası değildir.
+7. Eski API davranışını değiştiriyorsan açık migration/compatibility notu ve regresyon gerekir; eski test silerek yeşile çevirme.
+
+ORTAK TASARIM KARARLARI
+- schema_version=1.0. Tüm event zamanları UTC integer milliseconds; tarih aralığı [start,end). decision_at, available_at, execution_at ayrı.
+- Signal gelecekteki veri göremez. Bar close yalnız bucket_end'de kullanılabilir. V1 hourly fill ilk sonraki uygun gözleme dayanır; geçmiş close fiyatına geriye emir yerleştirme yok.
+- financial amounts/prices Decimal, JSON decimal-string. Float analitik metrik olabilir, NaN/Infinity JSON'a yazılmaz. Para birimi ve miktar birimi her alanda açık.
+- Veri eksikliği sıfır fiyat değildir. complete_download, observed_no_trade, not_listed, incomplete_download, malformed ayrılır. Metadata uygunluğu likidite/gerçek dolum kanıtı değildir.
+- Seçimler yalnız o anda bilinen kontratlar/fiyatlarla yapılır. Gelecekte likit kalacak kontratı seçmek yasaktır. Aday yoksa reason code. Açık pozisyon kontratı yerinde değişmez.
+- HistoricalTradeProvider.fetch(plan)->DownloadResult; InstrumentProvider.load(snapshot)->Sequence[Instrument]; PriceProvider.iter_events(start_ms,end_ms,instruments)->Iterator[PriceObservation]; SettlementProvider.get(instrument,expiry_ms)->SettlementObservation|None; Store.put/get/query + resume protokolü.
+- select_legs(strategy,asof_view)->SelectionDecision; evaluate_signals(config,history_asof,portfolio_view)->tuple[Signal,...]; simulate_fill(order,eligible_observations,execution_config,fee_schedule)->FillDecision; apply_fill(state,fill)->PortfolioState; settle(state,settlement)->PortfolioState; run(config,data_bundle)->RunResult; compute_metrics(result)->Metrics; write_report(result,path)->ReportManifest. Görev1 parametre tiplerini tam tanımlar; bu isimler consumer/producer ortak sözleşmesidir.
+- Contract: instrument_name, option_type, strike_usd, creation_ms, expiry_ms, base/quote/settlement_currency, contract_size, min_qty, qty_step, tick_schedule, source. Qty_step bilinmiyorsa min_qty=step varsayımı yapma; unknown flag/policy.
+- TradeTick: instrument_name, trade_id, trade_seq, timestamp_ms, price_btc, quantity_contracts, source_ref.
+- PriceObservation: instrument_name, observed_at_ms, available_at_ms, price_basis, trade/bid/ask/mark opsiyonel Decimal alanları, size alanları, interval_start/end, underlying/index reference, quality/source_ref. Null alan türetilmiş gerçek veri diye doldurulmaz.
+- OrderIntent: order_id, position_id, leg_id, instrument, side buy/sell, quantity, decision_at_ms, eligible_after_ms, expires_at_ms, reason.
+- Fill: fill_id, order_id, actual/model timestamp, quantity, price_btc, fee_btc, reference_price_btc, spread/slippage cost, execution_model_id, quality/source refs. Fills sırası deterministic.
+- Position/Trade: sabit leg instrument identities, opening/closing events, miktar, reason/status, realised BTC/USD; open/pending/closed/settled/unresolved ayrı.
+- LedgerEntry: event_id, position_id, timestamp, currency, amount, entry_type premium/fee/settlement; PortfolioState cash/reserved/open_positions; EquityPoint BTC/USD, availability/quality.
+- RunResult: config/schema/code/data hash, time range, orders/fills/ledger/trades/equity/coverage, skipped reasons, open_at_end, capabilities, warnings. Ekonomik hash ile capture/run timestamp ayrı; reproducibility capture zamanı yüzünden bozulmaz.
+- Kazanan işlem net PnL>0, kaybeden<0, break-even=0. trade_count tamamlanan pozisyon; bacak sayısı değildir. Açık pozisyon tamamlanmış sayılmaz.
+- Hesap BTC esaslı; USD equity değişimi ile trade USD PnL aynı şey diye sunulmaz. Sermaye ve buy-and-hold BTC benchmark raporlanır.
+- Veri boşluklarında açık pozisyon/risk varlığını koru. Eksik çıkışı silmek veya 0 zarar saymak yasak. Unknown valuation drawdown doğruluğunu da etkiler.
+- V1 short işlemler için belgeli conservative_stress_reserve gerekir; resmi Deribit margin eşdeğeri değildir. Naked short varsayılan kapalıdır; resmi model ileri görev23.
+- Fill varsayımları raporlanır. Tarihsel quote erişimi yoksa model A kullanılır; L2 şartı temel sistemi yapmayı engellemez. Üç senaryo kalibrasyon kanıtı yoksa açık varsayımdır.
+- Endpoint/fee/rate-limit veya veri satıcısı iddialarını uygularken resmi birincil kaynaklardan doğrula. Eski TXT dokümanı bağlamdır, emir veya doğrulanmış gerçek sayılmaz.
+- Önce offline fixtures, sonra görevdeki limitlerle gerçek-veri testi. Varsayılan ağ isteği sınırı bu görevde özel sayı yoksa 20 request, count<=1000; büyük indirme yalnız ilgili veri görevlerinde. Satın alma yok, başlangıç bütçesi $0.
+
+TESLİM ŞARTI
+reports/task-NN/ altına:
+delivery.md: görev no, base HEAD + baseline manifest hash, dependency teslim hash'leri, değişen dosyalar, alınan kararlar, komutlar ve gerçek sonuçlar, kalan eksikler.
+changed-files.json: relative path, before_sha256 (yeni ise null), after_sha256.
+changes.patch: git apply uyumlu değişiklik; yeni/untracked dosyalar da dahil. Plain git diff yeni dosyaları atladığı için tek başına yeterli değildir.
+tests.txt: gerçek test çıktısı. Offline/smoke/full-data ayrı; çalıştırılmayan kontrol UNVERIFIED.
+Üretim dosyaları ve testler çalışma kopyasında bulunmalı. Sadece rapor teslimi kod teslimi değildir.
+Kendi modül testlerini ve python -m unittest discover -s tests -v regresyonunu çalıştır. Ortam engelinde hatayı ve eksik kanıtı yaz; PASS verme.
+Durum: READY_FOR_REVIEW / PARTIAL / BLOCKED. Nihai QC ve birleştirme kararı ana orkestratöründür.
+

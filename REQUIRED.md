@@ -1,5 +1,7 @@
 # Gerekenler Durumu
 
+> Bu liste ilk geliştirme döneminin kaydıdır. Güncel kapsam, bilinen hatalar ve Görev1 devam noktası için docs/STATUS.md ve docs/HANDOFF.md esas alınır. 24 görev henüz uygulanmadı; eski işaretler uçtan uca ürün kabulü değildir.
+
 Bu liste, her yeni bilgi sonrası güncellenir. Tik yalnızca kanıtı görülen maddeye atılır.
 
 - [x] Proje amacı: opsiyon stratejilerini gerçek para kullanmadan mantık/maliyet açısından test etmek.

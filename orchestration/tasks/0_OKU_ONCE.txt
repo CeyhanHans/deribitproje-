@@ -1,0 +1,115 @@
+GPT GÖREV LİSTESİ — ANA ORKESTRASYON PAKETİ
+Tarih: 2026-09-09
+Konum: C:\Users\user\Desktop\gptgorevliste
+Kaynak proje: C:\Users\user\Documents\Codex\2026-09-08\tes\deribit-options-backtest-catalog
+
+HEDEF
+İstenen tarih aralığı ve desteklenen opsiyon stratejisiyle gerçek piyasa verisinden tekrarlanan işlemler, kazanma/kaybetme oranı, net getiri ve risk raporu üretmek. Profesyonellik hedefi: doğrulanabilir muhasebe, zaman güvenliği, eksiksizlik kontrolü, yeniden üretilebilir çalışma ve açık emir modeli. İlk sürüm BTC inverse; diğer ürünler için ayrı adaptör ve kabul gerekir.
+
+BUGÜN DOĞRULANAN DURUM
+HEAD ea62db2439f801de7ef247ffe3b6047f4dec33fa.
+64/64 test bu oturumda geçti. Bu rakam ürünün tamamlandığı anlamına gelmez.
+git remote -v boş: bu çalışma kopyasına bağlı GitHub remote yok. İncelenmiş kaynak yerel kopyadır; bilinmeyen GitHub deposu incelendi iddiası yok.
+Untracked: ingestion/contract_catalog.py ve tests/test_contract_catalog.py. Git commit tek başına güncel başlangıcı içermez.
+Kod değiştirilmedi; bu paket görev metinlerini içerir.
+
+MEVCUT PARÇALAR
+History ve canlı snapshot ayrımı, trade bar aggregation, underlying perpetual proxy, çok-bacak schema, tek-pozisyon PnL motoru, strict matcher, temel katalog seçicisi.
+Önceki kayıtlardaki %55/%62 tamamlanma oranları bu geniş ürün kapsamının ölçülmüş oranı değildir. Takip bundan sonra görev kabulüyle yapılacak.
+
+KAYNAK DENETİMİNDEKİ AÇIKLAR
+1. strategies/backtest_engine.py:77: exit_observations girişte kalıyor; hiçbir exit tetiklenmezse final timestamp yanında yanlış giriş fiyatıyla PnL çıkabilir.
+2. Aynı dosya:111 trade_count=1; genel tekrarlayan işlem döngüsü yok.
+3. strategy_schema.py giriş adını validasyon yapıyor, backtest motoru sinyal kurallarını uygulamıyor. Tanım desteği çalışma desteği değildir.
+4. ingestion/deribit_history.py:197 min(timestamp)-1, sayfa sınırındaki aynı milisaniye trade'lerini atlayabilir; sorting açık değil.
+5. contract_catalog.py:102 sıfır DTE expiry sınırı; :183-191 eksik metadata varsayılanları ve sayı doğrulama açıkları; ilk vade eksik çiftte diğer uygun vadeyi değerlendirmiyor.
+6. historical_windows.py:121 dedup/eşit timestamp trade sırası ve sonlu sayı doğrulaması yeterli değil.
+7. Strict matcher eksik saatleri eşleşmeden çıkarır; açık pozisyon riski ve görünmeyen stop/exit yönetimi ayrıca kurulmalı.
+8. Gerçek settlement, BTC cash ledger, sermaye/margin, tüm dönem veri kapsamı, tekrar üretilebilir ürün komutu ve rapor tamamlanmış değil.
+9. Snapshot gerçek tarihsel bid/ask değildir. Geçmiş trade barları da eşzamanlı çok-bacak fiyat garantisi değildir.
+
+CEVAP7.TXT İÇİN KARAR
+Belge okundu, dış ortak yeniden çalıştırılmadı. Vade/strike kesişimi, listing zaman filtresi ve resmi delivery ilkeleri korunuyor.
+Düzeltmeler: gelecek expiry tek başına dışlama nedeni değildir; listing tarihi önemlidir. Aynı bar close ile karar+fill genel güvenli kural değildir. Eksik saatleri atlamak tüm bias'ları sıfırlamaz. %85 kapsama kanıtlanmış oran değil hedef; quarterly pilot tüm piyasayı temsil etmez. O(1) toplam katalog araması vaat edilmiyor.
+Bu belgeye gömülü uygulama onayı isteği çalıştırılmadı; mevcut kullanıcı isteği görev paketidir.
+
+NASIL GÖNDERECEKSİN?
+1. Önce 1.txt'yi ver. Her TXT ortak kuralları kendi içinde taşıyor; başka sohbet geçmişine ihtiyaç duymuyor.
+2. Ajan ayrıca kaynak çalışma kopyasına erişmeli. Başka bilgisayara TXT tek başına kodu taşımaz.
+3. Görev1'in sözleşme ve baseline teslimini ana orkestratöre getir; kabul edilince diğer görevlere dağıt.
+4. En basit yol 1,2,3,...20 sırası. İstersen aşağıdaki aynı dalga görevlerini farklı ajanlara verebilirsin. Şu anda hiçbir ajan başlatılmadı.
+5. Ajanlar aynı kaynak klasöründe eşzamanlı çalışmasın; dalganın onaylı başlangıcından ayrı kopyaları olsun. Önkoşul teslimleri olmadan sonraki görevi başlatma.
+6. Sonunda bütün teslimleri topluca getirebilirsin; ancak dalgalar arasında yalnız sözleşme/bağımlılık uyumu kontrolü gereklidir. Bütün bağımlı işleri son ana kadar hiç birleştirmemek uygulanabilir değildir.
+7. 19 denetimdir; 20 nihai birleştirme ana orkestratöründür. Ajan kendi işine nihai PASS veremez.
+8. 21..24 temel sürümden sonra veri/özellik ihtiyacına göre. 21'de ücretli kaynak gerekirse önce fiyat/kapsam raporu, satın alma ayrı kullanıcı kararı.
+9. Hata düzeltmesi ilgili dosya sahibine döner; aynı dosyada iki ajan düzelti yapmaz.
+
+DALGALAR (AYNI SATIRDAKİLER DOSYA SAHİPLİĞİ AÇISINDAN AYRI)
+A: 1 — ortak sözleşme ve başlangıç.
+B: 2,3,4,5,6,8 — bağımsız çekirdek modülleri.
+C: 7,9,10,11 — veri standardı, seçim, sinyal, execution.
+D: 12,14 — portföy ve gerçek veri pilotu.
+E: 13,15 — olay motoru ve rapor.
+F: 16 — entegrasyon.
+G: 17,18 — gerçek dönem kabulü ve deneyler.
+H: 19 — bağımsız QC.
+I: 20 — ana orkestratör birleştirme/teslim.
+J: 21,23 — gelişmiş veri/margin.
+K: 22 — defter execution.
+L: 24 — uzantılar ve son entegrasyon.
+
+GÖREV ENVANTERİ
+1. Ortak başlangıç paketi ve değiştirilemez arayüzler
+   Önkoşul: Yok. Dosya: 1.txt
+2. Mevcut tek-pozisyon motorunun kritik hatalarını düzelt
+   Önkoşul: 1. Dosya: 2.txt
+3. Tarihsel kontrat kataloğunu sağlamlaştır
+   Önkoşul: 1. Dosya: 3.txt
+4. Kayıpsız ve devam edebilir geçmiş işlem indirme
+   Önkoşul: 1. Dosya: 4.txt
+5. Veri deposu, önbellek ve kanıt manifesti
+   Önkoşul: 1. Dosya: 5.txt
+6. Underlying, tarihsel fiyatlandırma ve resmi settlement
+   Önkoşul: 1. Dosya: 6.txt
+7. Bar üretimi ve veri kapsamı
+   Önkoşul: 1, 4. Dosya: 7.txt
+8. Genel strateji ve tarih aralığı yapılandırması
+   Önkoşul: 1. Dosya: 8.txt
+9. Genel çok-bacaklı kontrat seçimi
+   Önkoşul: 1, 3, 8. Dosya: 9.txt
+10. Sinyal ve takvim motoru
+   Önkoşul: 1, 8. Dosya: 10.txt
+11. Açık fill modeli ve maliyet senaryoları
+   Önkoşul: 1, 6, 8. Dosya: 11.txt
+12. BTC hesap defteri ve pozisyon sermayesi
+   Önkoşul: 1, 6, 8, 11. Dosya: 12.txt
+13. Çoklu işlem olay motoru
+   Önkoşul: 1, 7, 9, 10, 11, 12. Dosya: 13.txt
+14. Veri pilotu ve kaynak yeterlilik kapısı
+   Önkoşul: 1, 3, 4, 5, 6, 7. Dosya: 14.txt
+15. Performans ölçümleri ve rapor
+   Önkoşul: 1, 12. Dosya: 15.txt
+16. Tek komutla veri hazırlama ve backtest entegrasyonu
+   Önkoşul: 1, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15. Dosya: 16.txt
+17. Tekrarlanabilir gerçek veri kabulü
+   Önkoşul: 13, 14, 15, 16. Dosya: 17.txt
+18. Senaryo karşılaştırma ve aşırı uyum denetimi
+   Önkoşul: 15, 16. Dosya: 18.txt
+19. Bağımsız ekonomik ve yazılım kalite kontrolü
+   Önkoşul: 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18. Dosya: 19.txt
+20. Son birleştirme, paketleme ve kullanım rehberi
+   Önkoşul: 19. Dosya: 20.txt
+21. Tarihsel bid/ask ve L2 veri sağlayıcı uzantısı
+   Önkoşul: 20. Dosya: 21.txt
+22. Emir defteri, kısmi dolum ve gecikme simülasyonu
+   Önkoşul: 21. Dosya: 22.txt
+23. Short stratejiler için tarihsel margin ve likidasyon
+   Önkoşul: 20. Dosya: 23.txt
+24. İleri strateji eklentileri ve son uzantı entegrasyonu
+   Önkoşul: 20, 21, 22, 23. Dosya: 24.txt
+
+BİTTİ ÖLÇÜTÜ
+Görev20 READY: kritik QC açıkları yok, gerçek veride örnek dönem raporu mevcut, her işlem izlenebilir, veri/fee/fill varsayımları görünür, offline tekrar aynı sonucu veriyor, tarih ve strateji config'ten değişiyor.
+Veri kaynağı istenen dönemi desteklemezse sistem bunu raporlar; kod bitmiş olması bulunmayan veriyi var etmez.
+Görev24 ayrı gelişmiş sürümdür; temel ürünün tamamlanması buna bağlı değildir.
+

@@ -1,5 +1,22 @@
 # Deribit Options Backtest Catalog
 
+## Yeni bilgisayar veya ajan için başlangıç
+
+Bu depo kaynak kodu, karar gerekçelerini ve 24 görevlik uygulama planını içerir.
+**Durum: çekirdek prototip; tam backtest ürünü henüz tamamlanmadı.** Yayın hazırlığında 64/64 unit test geçti; gerçek tarih aralığında uçtan uca strateji raporu henüz yok.
+
+- [Güncel durum ve bilinen hatalar](docs/STATUS.md)
+- [Kararlar ve gerekçeleri](docs/DECISIONS.md)
+- [Kurulum ve kaldığımız yerden devam](docs/HANDOFF.md)
+- [Ajan kuralları](AGENTS.md)
+- [Görev sırası](orchestration/tasks/0_OKU_ONCE.txt) · [İlk görev](orchestration/tasks/1.txt) · [Ortak mimari](orchestration/tasks/ORTAK_MIMARI.txt)
+
+Hedef: seçilen tarih aralığında, yapılandırılabilir opsiyon stratejisiyle gerçek piyasa verisinden işlem sayısı, kazanma/kaybetme oranı, net PnL ve risk raporu üretmek. Long straddle ve 2024 Mart–2025 Mayıs yalnız kabul örnekleridir.
+
+Python 3.11+ ile: `python -m unittest discover -s tests -v`.
+Mevcut yayın hazırlığı Python 3.14.7 üzerinde doğrulandı; 3.11 ayrı ortamda henüz denenmedi.
+Sonraki adım Görev1 sözleşme/baseline kabulüdür. Aşağıdaki ilk taslak ve eski katalog/raporlardaki plan ifadeleri mevcut implementasyon kanıtı değildir; güncel durumda docs/STATUS.md esas alınır.
+
 Kişisel Deribit opsiyon stratejilerini **gerçek para riske atmadan** önce test etmek için düşük maliyetli araştırma kataloğu.
 
 ## Hedef
