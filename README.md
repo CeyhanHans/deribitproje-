@@ -1,5 +1,7 @@
 # Deribit Options Backtest Catalog
 
+> Güncel durum (2026-09-10): [Görev kabul panosu](docs/TASK-STATUS.md) ve [yarın devam checkpoint'i](reports/checkpoints/2026-09-10/README.md). Eski test sayıları/durum paragrafları tarihsel; 1–14'ün kodlanması hepsinin kabul edildiği anlamına gelmez.
+
 ## Yeni bilgisayar veya ajan için başlangıç
 
 Bu depo kaynak kodu, karar gerekçelerini ve 24 görevlik uygulama planını içerir.

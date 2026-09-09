@@ -1,5 +1,7 @@
 # Güncel durum — 2026-09-09
 
+> 2026-09-10 GÜNCEL KABUL KAYDI: [TASK-STATUS.md](TASK-STATUS.md). 2 kabul; 3 son revizyon kabul fakat uygulanmadı; 1 ve4–6 revizyon; 7–14 teslim/QC bekliyor; 15–24 planlı. Aşağıdaki64 test ve “tümü planlı” ifadeleri tarihsel baseline'dır. Son kaynak256, ayrı teslim262 test geçti; tüm ürün kabulü yok.
+
 ## Gerçek durum
 Çalışan bir Python çekirdeği ve 24 görevlik uygulama planı var. Tam genel amaçlı backtest ürünü henüz yok. Önceki %55/%62 oranları eski tahminlerdir; güncel geniş kapsamın ölçüsü değildir.
 

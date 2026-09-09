@@ -1,5 +1,7 @@
 # Başka bilgisayardan devam
 
+ÖNCE [güncel kabul panosunu](TASK-STATUS.md) ve [2026-09-10 checkpoint'i](../reports/checkpoints/2026-09-10/README.md) oku. Sonraki tek iş dış AI'ın Görev1 revizyonunu son üç QC bulgusuna karşı kontrol etmek. Aşağıdaki “Görev1 henüz yok” satırları tarihsel; artık kaynak61101f2'de1–14 teslimleri bulunuyor, fakat kabul durumları farklı.
+
 ```sh
 git clone https://github.com/CeyhanHans/deribitproje-.git
 cd deribitproje-

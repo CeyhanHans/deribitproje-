@@ -1,0 +1,837 @@
+diff --git a/core/__init__.py b/core/__init__.py
+index 589e1c8..d3df363 100644
+--- a/core/__init__.py
++++ b/core/__init__.py
+@@ -55,6 +55,18 @@ from core.contracts import (
+     BacktestRunnerProtocol,
+     MetricsCalculatorProtocol,
+     ReportWriterProtocol,
++    TickScheduleStep,
++    TickSchedule,
++    DownloadPlan,
++    InstrumentSnapshotProtocol,
++    InstrumentSnapshot,
++    StrategyLegProtocol,
++    StrategyLegSpec,
++    StrategySpec,
++    HistoryAsOfView,
++    CANONICAL_EXECUTION_MODELS,
++    EXECUTION_MODEL_MIGRATION_TABLE,
++    resolve_canonical_execution_model,
+     to_dict,
+     from_dict,
+     to_json,
+@@ -72,6 +84,9 @@ __all__ = [
+     "PriceBasis",
+     "DataQuality",
+     "ExecutionModelId",
++    "CANONICAL_EXECUTION_MODELS",
++    "EXECUTION_MODEL_MIGRATION_TABLE",
++    "resolve_canonical_execution_model",
+     "EntryType",
+     "PositionStatus",
+     "ReasonCode",
+@@ -79,6 +94,8 @@ __all__ = [
+     "RunConfig",
+     "Instrument",
+     "Contract",
++    "TickScheduleStep",
++    "TickSchedule",
+     "TradeTick",
+     "PriceObservation",
+     "CoverageReport",
+@@ -101,13 +118,20 @@ __all__ = [
+     "PriceProvider",
+     "SettlementProvider",
+     "Store",
++    "StrategyLegProtocol",
++    "StrategyLegSpec",
+     "StrategyProtocol",
++    "StrategySpec",
+     "AsOfViewProtocol",
+     "HistoryAsOfProtocol",
++    "HistoryAsOfView",
+     "ExecutionConfigProtocol",
+     "FeeScheduleProtocol",
+     "DataBundleProtocol",
+     "DownloadPlanProtocol",
++    "DownloadPlan",
++    "InstrumentSnapshotProtocol",
++    "InstrumentSnapshot",
+     "LegSelectorProtocol",
+     "SignalEvaluatorProtocol",
+     "FillSimulatorProtocol",
+diff --git a/core/contracts.py b/core/contracts.py
+index 98926e2..c7bb8f1 100644
+--- a/core/contracts.py
++++ b/core/contracts.py
+@@ -93,12 +93,60 @@ class DataQuality(str, Enum):
+ 
+ 
+ class ExecutionModelId(str, Enum):
++    # Canonical models (Task 11 / ORTAK_MIMARI)
++    MODEL_A_TRADE_ESTIMATED = "model_a_trade_estimated"
++    MODEL_B_BID_ASK_REPLAY = "model_b_bid_ask_replay"
++
++    # Preserved legacy identifiers for backward compatibility
+     MODEL_A_BID_ASK = "model_a_bid_ask"
+     MODEL_B_MID_SLIPPAGE = "model_b_mid_slippage"
+     MODEL_C_TRADE_BAR_CLOSE = "model_c_trade_bar_close"
+     MODEL_D_QUOTE_L2 = "model_d_quote_l2"
+ 
+ 
++CANONICAL_EXECUTION_MODELS: Dict[ExecutionModelId, str] = {
++    ExecutionModelId.MODEL_A_TRADE_ESTIMATED: (
++        "Trade-based estimated execution (fills at first eligible trade or bar open after decision; "
++        "retroactive fill to pre-decision bar close is prohibited)"
++    ),
++    ExecutionModelId.MODEL_B_BID_ASK_REPLAY: (
++        "Historical bid/ask replay (buys at ask, sells at bid; "
++        "silent fallback to Model A on missing quote is prohibited)"
++    ),
++}
++
++EXECUTION_MODEL_MIGRATION_TABLE: Dict[str, ExecutionModelId] = {
++    # Canonical identifiers
++    "model_a_trade_estimated": ExecutionModelId.MODEL_A_TRADE_ESTIMATED,
++    "model_b_bid_ask_replay": ExecutionModelId.MODEL_B_BID_ASK_REPLAY,
++    # Preserved legacy mappings
++    "model_a_bid_ask": ExecutionModelId.MODEL_A_BID_ASK,
++    "model_b_mid_slippage": ExecutionModelId.MODEL_B_MID_SLIPPAGE,
++    "model_c_trade_bar_close": ExecutionModelId.MODEL_C_TRADE_BAR_CLOSE,
++    "model_d_quote_l2": ExecutionModelId.MODEL_D_QUOTE_L2,
++}
++
++
++def resolve_canonical_execution_model(model_identifier: Union[str, ExecutionModelId]) -> ExecutionModelId:
++    """Resolve an execution model identifier to a validated ExecutionModelId.
++
++    Raises ValidationError for unknown or ambiguous identifiers.
++    """
++    if isinstance(model_identifier, ExecutionModelId):
++        val = model_identifier.value
++    elif isinstance(model_identifier, str):
++        val = model_identifier.strip().lower()
++    else:
++        raise ValidationError(f"Invalid model identifier type: {type(model_identifier).__name__}")
++
++    if val in EXECUTION_MODEL_MIGRATION_TABLE:
++        return EXECUTION_MODEL_MIGRATION_TABLE[val]
++    raise ValidationError(
++        f"Unknown or ambiguous execution model identifier: '{model_identifier}'. "
++        f"Known models: {sorted(EXECUTION_MODEL_MIGRATION_TABLE.keys())}"
++    )
++
++
+ class EntryType(str, Enum):
+     PREMIUM = "premium"
+     FEE = "fee"
+@@ -298,6 +346,70 @@ class RunConfig:
+         object.__setattr__(self, "deterministic_seed", validate_int(self.deterministic_seed, "deterministic_seed"))
+ 
+ 
++@dataclass(frozen=True)
++class TickScheduleStep:
++    """A single tier in a tick size schedule.
++
++    For price < threshold_price_btc, the minimum tick size is tick_size_btc.
++    """
++    threshold_price_btc: Decimal
++    tick_size_btc: Decimal
++
++    def __post_init__(self) -> None:
++        object.__setattr__(
++            self,
++            "threshold_price_btc",
++            validate_decimal(self.threshold_price_btc, "threshold_price_btc", strictly_positive=True),
++        )
++        object.__setattr__(
++            self,
++            "tick_size_btc",
++            validate_decimal(self.tick_size_btc, "tick_size_btc", strictly_positive=True),
++        )
++
++
++@dataclass(frozen=True)
++class TickSchedule:
++    """Ordered schedule of tick sizes based on price thresholds.
++
++    Invariants:
++    - Steps must be strictly ascending by threshold_price_btc (no overlapping or equal thresholds).
++    - Thresholds and tick sizes must be strictly positive.
++    - default_tick_size_btc applies when price >= highest step threshold.
++    """
++    steps: Tuple[TickScheduleStep, ...] = ()
++    default_tick_size_btc: Decimal = Decimal("0.0005")
++
++    def __post_init__(self) -> None:
++        object.__setattr__(
++            self,
++            "default_tick_size_btc",
++            validate_decimal(self.default_tick_size_btc, "default_tick_size_btc", strictly_positive=True),
++        )
++        if not isinstance(self.steps, (tuple, list)):
++            raise ValidationError(f"steps must be a tuple or list, got {type(self.steps).__name__}")
++        object.__setattr__(self, "steps", tuple(self.steps))
++
++        prev_thresh = Decimal("0")
++        for i, step in enumerate(self.steps):
++            if not isinstance(step, TickScheduleStep):
++                raise ValidationError(f"Step {i} must be an instance of TickScheduleStep, got {type(step).__name__}")
++            if step.threshold_price_btc <= prev_thresh:
++                raise ValidationError(
++                    f"Tick schedule steps must be strictly ascending: step {i} threshold "
++                    f"{step.threshold_price_btc} <= previous threshold {prev_thresh}"
++                )
++            prev_thresh = step.threshold_price_btc
++
++    def get_tick_size(self, price_btc: Decimal) -> Decimal:
++        """Return the applicable tick size for a given price in BTC."""
++        price = validate_decimal(price_btc, "price_btc", non_negative=True)
++        for step in self.steps:
++            if price < step.threshold_price_btc:
++                return step.tick_size_btc
++        return self.default_tick_size_btc
++
++
+ @dataclass(frozen=True)
+ class Instrument:
+     """Specification of an options contract."""
+@@ -315,6 +427,7 @@ class Instrument:
+     qty_step: Optional[Decimal] = None
+     qty_step_known: bool = False
+     tick_size: Decimal = Decimal("0.0005")
++    tick_schedule: Optional[TickSchedule] = None
+     source_ref: str = ""
+ 
+     def __post_init__(self) -> None:
+@@ -343,6 +456,12 @@ class Instrument:
+         )
+         object.__setattr__(self, "min_qty", validate_decimal(self.min_qty, "min_qty", strictly_positive=True))
+         object.__setattr__(self, "tick_size", validate_decimal(self.tick_size, "tick_size", strictly_positive=True))
++        if self.tick_schedule is None:
++            object.__setattr__(self, "tick_schedule", TickSchedule(default_tick_size_btc=self.tick_size))
++        elif not isinstance(self.tick_schedule, TickSchedule):
++            raise ValidationError(
++                f"tick_schedule must be an instance of TickSchedule, got {type(self.tick_schedule).__name__}"
++            )
+         if self.qty_step is not None:
+             object.__setattr__(self, "qty_step", validate_decimal(self.qty_step, "qty_step", strictly_positive=True))
+         if not isinstance(self.qty_step_known, bool):
+@@ -631,8 +750,10 @@ class Fill:
+     price_btc: Decimal
+     fee_btc: Decimal
+     reference_price_btc: Decimal
+-    spread_slippage_cost_btc: Decimal
+-    execution_model_id: ExecutionModelId
++    spread_slippage_cost_btc: Decimal = Decimal("0.0")
++    execution_model_id: ExecutionModelId = ExecutionModelId.MODEL_A_BID_ASK
++    spread_cost_btc: Optional[Decimal] = None
++    slippage_cost_btc: Optional[Decimal] = None
+     source_ref: str = ""
+ 
+     def __post_init__(self) -> None:
+@@ -653,9 +774,29 @@ class Fill:
+         object.__setattr__(self, "price_btc", validate_decimal(self.price_btc, "price_btc", non_negative=True))
+         object.__setattr__(self, "fee_btc", validate_decimal(self.fee_btc, "fee_btc", non_negative=True))
+         object.__setattr__(self, "reference_price_btc", validate_decimal(self.reference_price_btc, "reference_price_btc", non_negative=True))
+-        object.__setattr__(self, "spread_slippage_cost_btc", validate_decimal(self.spread_slippage_cost_btc, "spread_slippage_cost_btc", non_negative=True))
+         object.__setattr__(self, "execution_model_id", validate_enum(self.execution_model_id, ExecutionModelId, "execution_model_id"))
+ 
++        if self.spread_cost_btc is not None:
++            object.__setattr__(self, "spread_cost_btc", validate_decimal(self.spread_cost_btc, "spread_cost_btc", non_negative=True))
++        if self.slippage_cost_btc is not None:
++            object.__setattr__(self, "slippage_cost_btc", validate_decimal(self.slippage_cost_btc, "slippage_cost_btc", non_negative=True))
++
++        if self.spread_cost_btc is not None and self.slippage_cost_btc is not None:
++            sum_cost = self.spread_cost_btc + self.slippage_cost_btc
++            if self.spread_slippage_cost_btc == Decimal("0.0"):
++                object.__setattr__(self, "spread_slippage_cost_btc", sum_cost)
++            elif abs(self.spread_slippage_cost_btc - sum_cost) > Decimal("1e-12"):
++                raise ValidationError(
++                    f"spread_slippage_cost_btc ({self.spread_slippage_cost_btc}) does not match "
++                    f"sum of spread_cost_btc ({self.spread_cost_btc}) and slippage_cost_btc ({self.slippage_cost_btc})"
++                )
++        else:
++            object.__setattr__(
++                self,
++                "spread_slippage_cost_btc",
++                validate_decimal(self.spread_slippage_cost_btc, "spread_slippage_cost_btc", non_negative=True),
++            )
++
+ 
+ @dataclass(frozen=True)
+ class FillDecision:
+@@ -914,16 +1055,66 @@ class DownloadResult:
+ 
+ 
+ # ==============================================================================
+-# 5. Domain Object Protocols
++# 5. Domain Object Protocols & Concrete Types
+ # ==============================================================================
+ 
++@runtime_checkable
++class StrategyLegProtocol(Protocol):
++    """Protocol representing a single strategy leg contract requirement."""
++    @property
++    def name(self) -> str:
++        ...
++
++    @property
++    def option_type(self) -> str:
++        ...
++
++    @property
++    def side(self) -> str:
++        ...
++
++
++@dataclass(frozen=True)
++class StrategyLegSpec:
++    """Concrete specification for a strategy leg satisfying StrategyLegProtocol."""
++    name: str
++    option_type: OptionType
++    side: Side
++    quantity: Decimal = Decimal("1.0")
++
++    def __post_init__(self) -> None:
++        if not self.name or not isinstance(self.name, str):
++            raise ValidationError("Strategy leg name must be a non-empty string")
++        object.__setattr__(self, "option_type", validate_enum(self.option_type, OptionType, "option_type"))
++        object.__setattr__(self, "side", validate_enum(self.side, Side, "side"))
++        object.__setattr__(self, "quantity", validate_decimal(self.quantity, "quantity", strictly_positive=True))
++
++
+ @runtime_checkable
+ class StrategyProtocol(Protocol):
+-    """Protocol representing a strategy definition."""
++    """Protocol representing a strategy definition with required legs."""
+     @property
+     def name(self) -> str:
+         ...
+ 
++    @property
++    def legs(self) -> Sequence[StrategyLegProtocol]:
++        ...
++
++
++@dataclass(frozen=True)
++class StrategySpec:
++    """Concrete strategy specification satisfying StrategyProtocol."""
++    name: str
++    legs: Tuple[StrategyLegSpec, ...] = ()
++
++    def __post_init__(self) -> None:
++        if not self.name or not isinstance(self.name, str):
++            raise ValidationError("Strategy name must be a non-empty string")
++        for i, leg in enumerate(self.legs):
++            if not isinstance(leg, StrategyLegSpec) and not isinstance(leg, StrategyLegProtocol):
++                raise ValidationError(f"legs[{i}] must satisfy StrategyLegProtocol, got {type(leg).__name__}")
++
+ 
+ @runtime_checkable
+ class AsOfViewProtocol(Protocol):
+@@ -948,6 +1139,37 @@ class HistoryAsOfProtocol(Protocol):
+     def decision_at_ms(self) -> int:
+         ...
+ 
++    @property
++    def completed_bars(self) -> Sequence[PriceObservation]:
++        ...
++
++    @property
++    def candidate_instruments(self) -> Sequence[Instrument]:
++        ...
++
++
++@dataclass(frozen=True)
++class HistoryAsOfView:
++    """Concrete view of historical data available as-of a decision timestamp."""
++    decision_at_ms: int
++    completed_bars: Tuple[PriceObservation, ...] = ()
++    candidate_instruments: Tuple[Instrument, ...] = ()
++
++    def __post_init__(self) -> None:
++        if isinstance(self.decision_at_ms, bool) or not isinstance(self.decision_at_ms, int) or self.decision_at_ms <= 0:
++            raise ValidationError(f"decision_at_ms must be a positive integer, got {self.decision_at_ms}")
++        for i, bar in enumerate(self.completed_bars):
++            if not isinstance(bar, PriceObservation):
++                raise ValidationError(f"completed_bars[{i}] must be a PriceObservation instance, got {type(bar).__name__}")
++            if bar.available_at_ms > self.decision_at_ms:
++                raise ValidationError(
++                    f"Lookahead violation: bar {bar.instrument_name} available_at_ms {bar.available_at_ms} "
++                    f"> decision_at_ms {self.decision_at_ms}"
++                )
++        for i, inst in enumerate(self.candidate_instruments):
++            if not isinstance(inst, Instrument):
++                raise ValidationError(f"candidate_instruments[{i}] must be an Instrument instance, got {type(inst).__name__}")
++
+ 
+ @runtime_checkable
+ class ExecutionConfigProtocol(Protocol):
+@@ -983,11 +1205,71 @@ class DataBundleProtocol(Protocol):
+ 
+ @runtime_checkable
+ class DownloadPlanProtocol(Protocol):
+-    """Protocol representing history download plan."""
++    """Protocol representing history download plan with time boundaries."""
+     @property
+     def instrument_name(self) -> str:
+         ...
+ 
++    @property
++    def start_timestamp(self) -> int:
++        ...
++
++    @property
++    def end_timestamp(self) -> int:
++        ...
++
++
++@dataclass(frozen=True)
++class DownloadPlan:
++    """Concrete download plan satisfying DownloadPlanProtocol."""
++    instrument_name: str
++    start_timestamp: int
++    end_timestamp: int
++
++    def __post_init__(self) -> None:
++        if not self.instrument_name or not isinstance(self.instrument_name, str):
++            raise ValidationError("instrument_name must be a non-empty string")
++        if isinstance(self.start_timestamp, bool) or not isinstance(self.start_timestamp, int):
++            raise ValidationError("start_timestamp must be an integer")
++        if isinstance(self.end_timestamp, bool) or not isinstance(self.end_timestamp, int):
++            raise ValidationError("end_timestamp must be an integer")
++        if self.start_timestamp < 0 or self.end_timestamp < 0:
++            raise ValidationError("timestamps must be non-negative")
++        if self.start_timestamp > self.end_timestamp:
++            raise ValidationError(
++                f"start_timestamp ({self.start_timestamp}) cannot exceed end_timestamp ({self.end_timestamp})"
++            )
++
++    @property
++    def start_ms(self) -> int:
++        return self.start_timestamp
++
++    @property
++    def end_ms(self) -> int:
++        return self.end_timestamp
++
++
++@runtime_checkable
++class InstrumentSnapshotProtocol(Protocol):
++    """Protocol representing an instrument catalog snapshot."""
++    @property
++    def instruments(self) -> Sequence[Instrument]:
++        ...
++
++
++@dataclass(frozen=True)
++class InstrumentSnapshot:
++    """Concrete snapshot of instruments."""
++    instruments: Tuple[Instrument, ...] = ()
++    as_of_ms: int = 0
++
++    def __post_init__(self) -> None:
++        if isinstance(self.as_of_ms, bool) or not isinstance(self.as_of_ms, int) or self.as_of_ms < 0:
++            raise ValidationError("as_of_ms must be a non-negative integer")
++        for i, inst in enumerate(self.instruments):
++            if not isinstance(inst, Instrument):
++                raise ValidationError(f"instruments[{i}] must be an Instrument instance, got {type(inst).__name__}")
++
+ 
+ # ==============================================================================
+ # 6. Provider Protocols
+@@ -996,7 +1278,7 @@ class DownloadPlanProtocol(Protocol):
+ @runtime_checkable
+ class HistoricalTradeProvider(Protocol):
+     """Protocol for fetching historical trade data."""
+-    def fetch(self, plan: Union[DownloadPlanProtocol, Mapping[str, Any], Any]) -> DownloadResult:
++    def fetch(self, plan: DownloadPlanProtocol) -> DownloadResult:
+         ...
+ 
+ 
+@@ -1004,7 +1286,7 @@ class HistoricalTradeProvider(Protocol):
+ class InstrumentProvider(Protocol):
+     """Protocol for loading instruments / active universe."""
+     def load(
+-        self, snapshot: Union[Path, str, Sequence[Mapping[str, Any]], Sequence[Instrument], Any]
++        self, snapshot: Union[Path, str, Sequence[Instrument], InstrumentSnapshotProtocol]
+     ) -> Sequence[Instrument]:
+         ...
+ 
+@@ -1050,8 +1332,8 @@ class LegSelectorProtocol(Protocol):
+     """Protocol for selecting legs for option strategies."""
+     def __call__(
+         self,
+-        strategy: Union[StrategyProtocol, Mapping[str, Any]],
+-        asof_view: Union[AsOfViewProtocol, Mapping[str, Any]],
++        strategy: StrategyProtocol,
++        asof_view: AsOfViewProtocol,
+     ) -> SelectionDecision:
+         ...
+ 
+@@ -1061,8 +1343,8 @@ class SignalEvaluatorProtocol(Protocol):
+     """Protocol for evaluating trading signals at decision time."""
+     def __call__(
+         self,
+-        config: Union[RunConfig, Mapping[str, Any]],
+-        history_asof: Union[HistoryAsOfProtocol, Sequence[PriceObservation], Mapping[str, Any]],
++        config: RunConfig,
++        history_asof: HistoryAsOfProtocol,
+         portfolio_view: PortfolioState,
+     ) -> Tuple[Signal, ...]:
+         ...
+@@ -1075,8 +1357,8 @@ class FillSimulatorProtocol(Protocol):
+         self,
+         order: OrderIntent,
+         eligible_observations: Sequence[PriceObservation],
+-        execution_config: Optional[Union[ExecutionConfigProtocol, RunConfig, Mapping[str, Any]]] = None,
+-        fee_schedule: Optional[Union[FeeScheduleProtocol, Mapping[str, Any]]] = None,
++        execution_config: Optional[Union[ExecutionConfigProtocol, RunConfig]] = None,
++        fee_schedule: Optional[FeeScheduleProtocol] = None,
+     ) -> FillDecision:
+         ...
+ 
+@@ -1101,7 +1383,7 @@ class SettlerProtocol(Protocol):
+ class BacktestRunnerProtocol(Protocol):
+     """Protocol for running a backtest simulation."""
+     def __call__(
+-        self, config: RunConfig, data_bundle: Union[DataBundleProtocol, Mapping[str, Any], Any]
++        self, config: RunConfig, data_bundle: DataBundleProtocol
+     ) -> RunResult:
+         ...
+ 
+@@ -1283,6 +1565,7 @@ def make_sample_instrument(
+     quote_currency: Currency = Currency.BTC,
+     counter_currency: Currency = Currency.USD,
+     settlement_currency: Currency = Currency.BTC,
++    tick_schedule: Optional[TickSchedule] = None,
+ ) -> Instrument:
+     return Instrument(
+         instrument_name=instrument_name,
+@@ -1299,6 +1582,7 @@ def make_sample_instrument(
+         qty_step=None,
+         qty_step_known=False,
+         tick_size=Decimal("0.0005"),
++        tick_schedule=tick_schedule,
+         source_ref="test_fixture",
+     )
+ 
+@@ -1444,7 +1728,18 @@ def make_sample_fill(
+     actual_ms: int = 1711700000000,
+     price_btc: Decimal = Decimal("0.0860"),
+     fee_btc: Decimal = Decimal("0.0003"),
++    spread_cost_btc: Optional[Decimal] = Decimal("0.0006"),
++    slippage_cost_btc: Optional[Decimal] = Decimal("0.0004"),
++    spread_slippage_cost_btc: Optional[Decimal] = None,
+ ) -> Fill:
++    if spread_slippage_cost_btc is None:
++        if spread_cost_btc is not None and slippage_cost_btc is not None:
++            total_cost = spread_cost_btc + slippage_cost_btc
++        else:
++            total_cost = Decimal("0.0010")
++    else:
++        total_cost = spread_slippage_cost_btc
++
+     return Fill(
+         fill_id=fill_id,
+         order_id=order_id,
+@@ -1458,7 +1753,9 @@ def make_sample_fill(
+         price_btc=price_btc,
+         fee_btc=fee_btc,
+         reference_price_btc=Decimal("0.0850"),
+-        spread_slippage_cost_btc=Decimal("0.0010"),
++        spread_cost_btc=spread_cost_btc,
++        slippage_cost_btc=slippage_cost_btc,
++        spread_slippage_cost_btc=total_cost,
+         execution_model_id=ExecutionModelId.MODEL_A_BID_ASK,
+         source_ref="test_fixture",
+     )
+diff --git a/specs/contracts-v1.md b/specs/contracts-v1.md
+index 2e1a062..9a6f62e 100644
+--- a/specs/contracts-v1.md
++++ b/specs/contracts-v1.md
+@@ -1,15 +1,15 @@
+ # Deribit Options Backtest Engine — Data Contracts and System Specification (v1.0)
+ 
+ **Document Version:** 1.0  
+-**Date:** 2026-09-09  
+-**Status:** FROZEN / IMMUTABLE BASELINE  
++**Date:** 2026-09-10  
++**Status:** DRAFT / PENDING ORCHESTRATOR APPROVAL (REVISED FOR QC G1/G3)  
+ **Associated Code:** [`core/contracts.py`](file:///C:/Users/user/Documents/Codex/2026-09-08/tes/deribit-options-backtest-catalog/core/contracts.py)
+ 
+ ---
+ 
+ ## 1. Executive Summary & Design Principles
+ 
+-This specification establishes the authoritative, immutable contract schemas and protocols for the Deribit BTC Inverse Options Backtest Catalog. All downstream tasks (Tasks 2 through 24) must consume and produce these exact data types and follow the locked module interfaces.
++This specification establishes the authoritative contract schemas and protocols for the Deribit BTC Inverse Options Backtest Catalog. All downstream tasks (Tasks 2 through 24) must consume and produce these exact data types and follow the locked module interfaces.
+ 
+ ### Core Architectural Axioms
+ 1. **Schema Versioning:** `schema_version = "1.0"`. Any version mismatch will be strictly rejected.
+@@ -31,13 +31,13 @@ The following function signatures and protocols are locked for downstream module
+ 
+ | Module / Task | Responsible File | Function Signature / Protocol | Input Types | Output Type |
+ |---|---|---|---|---|
+-| **Task 3 / 9** | `strategies/selection.py` | `select_legs(strategy, asof_view)` | `Union[StrategyProtocol, Mapping], Union[AsOfViewProtocol, Mapping]` | [`SelectionDecision`](file:///C:/Users/user/Documents/Codex/2026-09-08/tes/deribit-options-backtest-catalog/core/contracts.py) |
+-| **Task 10** | `strategies/signals.py` | `evaluate_signals(config, history_asof, portfolio_view)` | `Union[RunConfig, Mapping], Union[HistoryAsOfProtocol, Sequence[PriceObservation], Mapping], PortfolioState` | `Tuple[Signal, ...]` |
+-| **Task 11** | `execution/fill_simulator.py` | `simulate_fill(order, eligible_observations, execution_config, fee_schedule)` | `OrderIntent, Sequence[PriceObservation], Optional[Union[ExecutionConfigProtocol, RunConfig, Mapping]], Optional[Union[FeeScheduleProtocol, Mapping]]` | [`FillDecision`](file:///C:/Users/user/Documents/Codex/2026-09-08/tes/deribit-options-backtest-catalog/core/contracts.py) |
++| **Task 3 / 9** | `strategies/selection.py` | `select_legs(strategy, asof_view)` | `StrategyProtocol, AsOfViewProtocol` | [`SelectionDecision`](file:///C:/Users/user/Documents/Codex/2026-09-08/tes/deribit-options-backtest-catalog/core/contracts.py) |
++| **Task 10** | `strategies/signals.py` | `evaluate_signals(config, history_asof, portfolio_view)` | `RunConfig, HistoryAsOfProtocol, PortfolioState` | `Tuple[Signal, ...]` |
++| **Task 11** | `execution/fill_simulator.py` | `simulate_fill(order, eligible_observations, execution_config, fee_schedule)` | `OrderIntent, Sequence[PriceObservation], Optional[Union[ExecutionConfigProtocol, RunConfig]], Optional[FeeScheduleProtocol]` | [`FillDecision`](file:///C:/Users/user/Documents/Codex/2026-09-08/tes/deribit-options-backtest-catalog/core/contracts.py) |
+ | **Task 12** | `portfolio/ledger.py` | `apply_fill(state, fill)` | [`PortfolioState`](file:///C:/Users/user/Documents/Codex/2026-09-08/tes/deribit-options-backtest-catalog/core/contracts.py), [`Fill`](file:///C:/Users/user/Documents/Codex/2026-09-08/tes/deribit-options-backtest-catalog/core/contracts.py) | [`PortfolioState`](file:///C:/Users/user/Documents/Codex/2026-09-08/tes/deribit-options-backtest-catalog/core/contracts.py) |
+ | **Task 6 / 12** | `portfolio/settlement_service.py` | `settle(state, settlement)` | [`PortfolioState`](file:///C:/Users/user/Documents/Codex/2026-09-08/tes/deribit-options-backtest-catalog/core/contracts.py), [`SettlementObservation`](file:///C:/Users/user/Documents/Codex/2026-09-08/tes/deribit-options-backtest-catalog/core/contracts.py) | [`PortfolioState`](file:///C:/Users/user/Documents/Codex/2026-09-08/tes/deribit-options-backtest-catalog/core/contracts.py) |
+-| **Task 13 / 16** | `engine/event_engine.py` / `strategies/backtest_engine.py` | `run(config, data_bundle)` | [`RunConfig`](file:///C:/Users/user/Documents/Codex/2026-09-08/tes/deribit-options-backtest-catalog/core/contracts.py), `Union[DataBundleProtocol, Mapping, Any]` | [`RunResult`](file:///C:/Users/user/Documents/Codex/2026-09-08/tes/deribit-options-backtest-catalog/core/contracts.py) |
+-| **Task 13 / 15** | `engine/metrics.py` | `compute_metrics(result)` | [`RunResult`](file:///C:/Users/user/Documents/Codex/2026-09-08/tes/deribit-options-backtest-catalog/core/contracts.py) | [`Metrics`](file:///C:/Users/user/Documents/Codex/2026-09-08/tes/deribit-options-backtest-catalog/core/contracts.py) |
++| **Task 13 / 16** | `engine/event_engine.py` / `strategies/backtest_engine.py` | `run(config, data_bundle)` | [`RunConfig`](file:///C:/Users/user/Documents/Codex/2026-09-08/tes/deribit-options-backtest-catalog/core/contracts.py), `DataBundleProtocol` | [`RunResult`](file:///C:/Users/user/Documents/Codex/2026-09-08/tes/deribit-options-backtest-catalog/core/contracts.py) |
++| **Task 15** | `reporting/metrics.py` | `compute_metrics(result)` | [`RunResult`](file:///C:/Users/user/Documents/Codex/2026-09-08/tes/deribit-options-backtest-catalog/core/contracts.py) | [`Metrics`](file:///C:/Users/user/Documents/Codex/2026-09-08/tes/deribit-options-backtest-catalog/core/contracts.py) |
+ | **Task 15** | `reporting/manifest.py` | `write_report(result, path)` | [`RunResult`](file:///C:/Users/user/Documents/Codex/2026-09-08/tes/deribit-options-backtest-catalog/core/contracts.py), `Union[Path, str]` | [`ReportManifest`](file:///C:/Users/user/Documents/Codex/2026-09-08/tes/deribit-options-backtest-catalog/core/contracts.py) |
+ 
+ ---
+@@ -57,10 +57,12 @@ The following function signatures and protocols are locked for downstream module
+   * `incomplete_download`: Source data missing or pagination severed.
+   * `malformed`: Corrupted data rejected by validation.
+ * **`ExecutionModelId`**:
+-  * `model_a_bid_ask`: Crosses the historical bid/ask spread.
+-  * `model_b_mid_slippage`: Mid-price execution with parameterised slippage.
+-  * `model_c_trade_bar_close`: Fills against trade bar close with liquidity checks.
+-  * `model_d_quote_l2`: Full L2 order-book queue simulation.
++  * `model_a_trade_estimated` (Canonical): Trade-based estimated execution at first eligible observation/bar open after decision timestamp. Retroactive fill to pre-decision bar close is prohibited.
++  * `model_b_bid_ask_replay` (Canonical): Historical bid/ask quote replay. Buys at ask, sells at bid. Missing quote strictly rejects fill; silent fallback to Model A is prohibited.
++  * `model_a_bid_ask` (Legacy Alias): Preserved for backward compatibility with early config drafts.
++  * `model_b_mid_slippage` (Legacy Alias): Mid-price execution with parameterised slippage.
++  * `model_c_trade_bar_close` (Legacy Alias): Fills against trade bar close with liquidity checks.
++  * `model_d_quote_l2` (Legacy Alias): Full L2 order-book queue simulation.
+ * **`EntryType`**: `"premium"`, `"fee"`, `"settlement"`, `"deposit"`, `"withdrawal"`, `"reserve_adjustment"`.
+ * **`PositionStatus`**: `"open"`, `"pending"`, `"closed"`, `"settled"`, `"unresolved"`.
+ * **`ReasonCode`**: `"entry_signal"`, `"stop_loss"`, `"take_profit"`, `"time_expiry"`, `"contract_expiry"`, `"market_close"`, `"data_missing"`, `"no_candidate_found"`, `"stress_reserve_exceeded"`, `"unspecified"`.
+@@ -100,6 +102,7 @@ The following function signatures and protocols are locked for downstream module
+ * `qty_step: Optional[Decimal]` — Minimum quantity increment. If unknown, must be `None`.
+ * `qty_step_known: bool` — Flag indicating whether `qty_step` is verified.
+ * `tick_size: Decimal` — Price tick size in BTC (default `0.0005`).
++* `tick_schedule: Optional[TickSchedule]` — Ordered schedule of tick sizes across price thresholds.
+ * `source_ref: str` — Provenance reference or catalog JSON file identifier.
+ 
+ #### 3. `TradeTick`
+@@ -180,7 +183,9 @@ The following function signatures and protocols are locked for downstream module
+ * `price_btc: Decimal` — Execution price in BTC per contract $\ge 0$.
+ * `fee_btc: Decimal` — Realized exchange fee in BTC $\ge 0$.
+ * `reference_price_btc: Decimal` — Unadjusted base observation price.
+-* `spread_slippage_cost_btc: Decimal` — Total friction cost incurred.
++* `spread_cost_btc: Optional[Decimal]` — Separately tracked bid/ask spread crossing cost in BTC.
++* `slippage_cost_btc: Optional[Decimal]` — Separately tracked slippage penalty cost in BTC.
++* `spread_slippage_cost_btc: Decimal` — Total friction cost incurred ($\text{spread} + \text{slippage}$).
+ * `execution_model_id: ExecutionModelId` — Model that generated this fill.
+ * `source_ref: str` — Observation provenance.
+ 
+diff --git a/specs/product-v1.md b/specs/product-v1.md
+index 0d2c1da..f5be9ae 100644
+--- a/specs/product-v1.md
++++ b/specs/product-v1.md
+@@ -80,12 +80,19 @@ flowchart LR
+ 
+ ## 4. Execution & Cost Models
+ 
+-| Model ID | Name | Execution Price | Liquidity Requirement | Use Case |
++### 4.1 Canonical Execution Models
++| Model ID | Name | Execution Price | Liquidity Requirement | Economic Invariant |
+ |---|---|---|---|---|
+-| `model_a_bid_ask` | Historical Bid/Ask | Buy at Ask, Sell at Bid | Requires valid bid/ask quotes | Conservative baseline |
+-| `model_b_mid_slippage` | Mid + Slippage | Mid price $\pm$ configured slippage | Requires valid trade or quotes | Sensitivity testing |
+-| `model_c_trade_bar_close` | Trade Bar Close | Fills at bar close price | Requires real traded volume | Volume-validated backtest |
+-| `model_d_quote_l2` | Order Book L2 | Queue position & depth fill | Requires full L2 snapshots | Advanced execution (v2) |
++| `model_a_trade_estimated` | Trade-Based Estimated | Fills at first eligible trade / subsequent bar open | Requires valid trade bar / tick after decision | Fills strictly after decision time; retroactive backfills to pre-decision bar close are prohibited |
++| `model_b_bid_ask_replay` | Historical Bid/Ask Replay | Buys at Ask, Sells at Bid | Requires valid bid/ask quotes at fill time | Missing quotes strictly reject execution; silent fallback to Model A is prohibited |
++
++### 4.2 Legacy Migration & Compatibility Mappings
++| Legacy Model ID | Target Canonical Model / Meaning | Migration Status |
++|---|---|---|
++| `model_a_bid_ask` | Historical Bid/Ask Replay (`model_b_bid_ask_replay`) | Preserved alias for early config drafts |
++| `model_b_mid_slippage` | Mid-Price + Parameterised Slippage | Preserved auxiliary model |
++| `model_c_trade_bar_close` | Trade Bar Close Execution | Preserved auxiliary model |
++| `model_d_quote_l2` | Full L2 Order-Book Queue Replay | Reserved for advanced execution (Tasks 21–24) |
+ 
+ ---
+ 
+diff --git a/tests/test_contracts_v1.py b/tests/test_contracts_v1.py
+index 2d5ad8c..36a4fa3 100644
+--- a/tests/test_contracts_v1.py
++++ b/tests/test_contracts_v1.py
+@@ -423,6 +423,175 @@ class TestContractsV1(unittest.TestCase):
+             cc.from_dict(cc.RunConfig, cfg_dict)
+         self.assertIn("misspelled_config", str(ctx.exception))
+ 
++    # =========================================================================
++    # QC G1-A, G1-B, G1-C Specific Verification Tests
++    # =========================================================================
++
++    def test_typed_boundary_interfaces_no_bare_any_g1_a(self) -> None:
++        """QC G1-A: Boundary protocols must have strictly typed signatures without bare Any or Union[..., Any]."""
++        # 1. HistoricalTradeProvider.fetch annotations
++        fetch_sig = inspect.signature(cc.HistoricalTradeProvider.fetch)
++        for param_name, param in fetch_sig.parameters.items():
++            self.assertNotEqual(param.annotation, Any, f"HistoricalTradeProvider.fetch param '{param_name}' must not be Any")
++            annotation_str = str(param.annotation)
++            self.assertNotIn("typing.Any", annotation_str, f"HistoricalTradeProvider.fetch param '{param_name}' must not include Any")
++        self.assertNotEqual(fetch_sig.return_annotation, Any)
++        self.assertNotIn("typing.Any", str(fetch_sig.return_annotation))
++
++        # 2. InstrumentProvider.load annotations
++        load_sig = inspect.signature(cc.InstrumentProvider.load)
++        for param_name, param in load_sig.parameters.items():
++            self.assertNotEqual(param.annotation, Any, f"InstrumentProvider.load param '{param_name}' must not be Any")
++            self.assertNotIn("typing.Any", str(param.annotation))
++        self.assertNotEqual(load_sig.return_annotation, Any)
++        self.assertNotIn("typing.Any", str(load_sig.return_annotation))
++
++        # 3. BacktestRunnerProtocol.__call__ annotations
++        runner_sig = inspect.signature(cc.BacktestRunnerProtocol.__call__)
++        for param_name, param in runner_sig.parameters.items():
++            self.assertNotEqual(param.annotation, Any, f"BacktestRunnerProtocol.__call__ param '{param_name}' must not be Any")
++            self.assertNotIn("typing.Any", str(param.annotation))
++        self.assertNotEqual(runner_sig.return_annotation, Any)
++        self.assertNotIn("typing.Any", str(runner_sig.return_annotation))
++
++    def test_typed_protocol_data_structures_validation_g1_a(self) -> None:
++        """QC G1-A: DownloadPlan, StrategySpec, and HistoryAsOfView validation and protocol conformance."""
++        # DownloadPlan validation
++        plan = cc.DownloadPlan(
++            instrument_name="BTC-27DEC24-90000-C",
++            start_timestamp=1000,
++            end_timestamp=2000,
++        )
++        self.assertEqual(plan.instrument_name, "BTC-27DEC24-90000-C")
++        self.assertEqual(plan.start_ms, 1000)
++        self.assertEqual(plan.end_ms, 2000)
++        self.assertIsInstance(plan, cc.DownloadPlanProtocol)
++
++        with self.assertRaises(cc.ValidationError):
++            cc.DownloadPlan(
++                instrument_name="BTC-27DEC24-90000-C",
++                start_timestamp=2000,
++                end_timestamp=1000,
++            )
++
++        # StrategySpec validation
++        leg = cc.StrategyLegSpec(
++            name="call_leg",
++            option_type=cc.OptionType.CALL,
++            side=cc.Side.BUY,
++            quantity=Decimal("1.0"),
++        )
++        self.assertIsInstance(leg, cc.StrategyLegProtocol)
++        strat = cc.StrategySpec(
++            name="btc_straddle",
++            legs=(leg,),
++        )
++        self.assertIsInstance(strat, cc.StrategyProtocol)
++
++        with self.assertRaises(cc.ValidationError):
++            cc.StrategySpec(name="", legs=(leg,))
++
++        # HistoryAsOfView validation
++        history = cc.HistoryAsOfView(
++            decision_at_ms=5000,
++            completed_bars=(),
++            candidate_instruments=(),
++        )
++        self.assertIsInstance(history, cc.HistoryAsOfProtocol)
++        with self.assertRaises(cc.ValidationError):
++            cc.HistoryAsOfView(decision_at_ms=-1)
++
++    def test_canonical_execution_model_vocabulary_and_migration_g1_b(self) -> None:
++        """QC G1-B: Canonical execution model vocabulary and backward compatibility migration table."""
++        # Canonical values
++        self.assertEqual(cc.ExecutionModelId.MODEL_A_TRADE_ESTIMATED.value, "model_a_trade_estimated")
++        self.assertEqual(cc.ExecutionModelId.MODEL_B_BID_ASK_REPLAY.value, "model_b_bid_ask_replay")
++
++        # Canonical resolution
++        self.assertEqual(
++            cc.resolve_canonical_execution_model(cc.ExecutionModelId.MODEL_A_TRADE_ESTIMATED),
++            cc.ExecutionModelId.MODEL_A_TRADE_ESTIMATED,
++        )
++        self.assertEqual(
++            cc.resolve_canonical_execution_model("model_a_trade_estimated"),
++            cc.ExecutionModelId.MODEL_A_TRADE_ESTIMATED,
++        )
++        self.assertEqual(
++            cc.resolve_canonical_execution_model("model_b_bid_ask_replay"),
++            cc.ExecutionModelId.MODEL_B_BID_ASK_REPLAY,
++        )
++
++        # Legacy aliases resolved via migration table
++        self.assertEqual(
++            cc.resolve_canonical_execution_model("model_a_bid_ask"),
++            cc.ExecutionModelId.MODEL_A_BID_ASK,
++        )
++        self.assertEqual(
++            cc.resolve_canonical_execution_model("model_b_mid_slippage"),
++            cc.ExecutionModelId.MODEL_B_MID_SLIPPAGE,
++        )
++        self.assertEqual(
++            cc.resolve_canonical_execution_model("model_c_trade_bar_close"),
++            cc.ExecutionModelId.MODEL_C_TRADE_BAR_CLOSE,
++        )
++        self.assertEqual(
++            cc.resolve_canonical_execution_model("model_d_quote_l2"),
++            cc.ExecutionModelId.MODEL_D_QUOTE_L2,
++        )
++
++        # Unknown model rejected
++        with self.assertRaises(cc.ValidationError):
++            cc.resolve_canonical_execution_model("model_z_unknown")
++
++    def test_tick_schedule_schema_and_cost_breakdown_g1_c(self) -> None:
++        """QC G1-C: TickSchedule on Instrument and spread_cost_btc / slippage_cost_btc on Fill."""
++        # 1. TickSchedule creation and ordering
++        steps = (
++            cc.TickScheduleStep(threshold_price_btc=Decimal("1000"), tick_size_btc=Decimal("0.0001")),
++            cc.TickScheduleStep(threshold_price_btc=Decimal("2000"), tick_size_btc=Decimal("0.0005")),
++        )
++        schedule = cc.TickSchedule(steps=steps, default_tick_size_btc=Decimal("0.0010"))
++        self.assertEqual(schedule.get_tick_size(Decimal("500")), Decimal("0.0001"))
++        self.assertEqual(schedule.get_tick_size(Decimal("1500")), Decimal("0.0005"))
++        self.assertEqual(schedule.get_tick_size(Decimal("2500")), Decimal("0.0010"))
++
++        # Overlapping or unordered steps rejected
++        bad_steps = (
++            cc.TickScheduleStep(threshold_price_btc=Decimal("2000"), tick_size_btc=Decimal("0.0005")),
++            cc.TickScheduleStep(threshold_price_btc=Decimal("1000"), tick_size_btc=Decimal("0.0001")),
++        )
++        with self.assertRaises(cc.ValidationError):
++            cc.TickSchedule(steps=bad_steps)
++
++        # 2. Instrument with tick_schedule round-trips
++        inst = cc.make_sample_instrument(tick_schedule=schedule)
++        self.assertIsNotNone(inst.tick_schedule)
++        inst_json = cc.to_json(inst)
++        inst_recon = cc.from_json(cc.Instrument, inst_json)
++        self.assertEqual(inst, inst_recon)
++
++        # 3. Fill with separate spread and slippage cost
++        fill = cc.make_sample_fill(
++            spread_cost_btc=Decimal("0.00003000"),
++            slippage_cost_btc=Decimal("0.00002000"),
++            fee_btc=Decimal("0.00001000"),
++        )
++        self.assertEqual(fill.spread_cost_btc, Decimal("0.00003000"))
++        self.assertEqual(fill.slippage_cost_btc, Decimal("0.00002000"))
++        self.assertEqual(fill.spread_slippage_cost_btc, Decimal("0.00005000"))
++
++        fill_json = cc.to_json(fill)
++        fill_recon = cc.from_json(cc.Fill, fill_json)
++        self.assertEqual(fill, fill_recon)
++        self.assertEqual(fill_recon.spread_cost_btc, Decimal("0.00003000"))
++        self.assertEqual(fill_recon.slippage_cost_btc, Decimal("0.00002000"))
++
++        # Negative costs rejected
++        with self.assertRaises(cc.ValidationError):
++            cc.make_sample_fill(spread_cost_btc=Decimal("-0.0001"))
++        with self.assertRaises(cc.ValidationError):
++            cc.make_sample_fill(slippage_cost_btc=Decimal("-0.0001"))
++
+ 
+ if __name__ == "__main__":
+     unittest.main()

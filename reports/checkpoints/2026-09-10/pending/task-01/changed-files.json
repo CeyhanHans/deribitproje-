@@ -1,0 +1,50 @@
+[
+  {
+    "path": "core/__init__.py",
+    "before_sha256": "71013e03e4ecec7db8029423529493ac93488e95282ea1963f36e00ef80e616e",
+    "after_sha256": "5dc3506554c200a040320a97e19c11c5584f24e7ffdabb30f08edb429a46c6b3",
+    "status": "modified"
+  },
+  {
+    "path": "core/contracts.py",
+    "before_sha256": "f494d99993be0760aaa6bdbf5591423a3b2cfd16cfbdf5db1fe6fec3a9ebabc0",
+    "after_sha256": "bf59db8a790125ccfc6ecc20df94cb13616f4c0f1988e3145464f5944ea47783",
+    "status": "modified"
+  },
+  {
+    "path": "specs/contracts-v1.md",
+    "before_sha256": "e5f032e50e43a2870b8b48cd64e2b89547311c9e1f7a7be98b56d58f9ada79aa",
+    "after_sha256": "6a6329d77bbf4c6657d55916087fc02a4a77b3379c9dbb379537cfb6a40964e0",
+    "status": "modified"
+  },
+  {
+    "path": "specs/product-v1.md",
+    "before_sha256": "fc1cbcf7f4241e95c2a735e435ba27f5bc786cdc4fa9fe05a897ec32d08539e8",
+    "after_sha256": "4c9a08debea52cfa4e00d819382e7be6916bd1a8088be3e86ee6c5cac2739807",
+    "status": "modified"
+  },
+  {
+    "path": "tests/test_contracts_v1.py",
+    "before_sha256": "de9bd5b32fe1429ca8af1fbfbb484ffe7c1b1767e5a05e7d0951a6659bcfd48f",
+    "after_sha256": "ba676872136204b8f2b33d172ae3d33c6e625abd6caee8d9d98b2ce51fa888a6",
+    "status": "modified"
+  },
+  {
+    "path": "reports/task-01/tests.txt",
+    "before_sha256": "203aebaff2d899882901638e57a2fe07bc7e8fc70e4965a5c75cefdcde7bd0e3",
+    "after_sha256": "736669c84c712dfe10557f336e8138aba2f2d9c8462ff57fe924377f2dcce40f",
+    "status": "modified"
+  },
+  {
+    "path": "reports/task-01/changes.patch",
+    "before_sha256": "a71f571a39712280c6807fa23817758b13dd3c00572517d1554e746a7f470adb",
+    "after_sha256": "8592e6850fa157f0e4cf8ca7099313a2428bee429cc3eced14f6cc443161176c",
+    "status": "modified"
+  },
+  {
+    "path": "reports/task-01/delivery.md",
+    "before_sha256": "b560b731e69e91853793b1d05729c58e457326c7376549c84828483557613dd8",
+    "after_sha256": "a1a1d11b9eb2c5f1b81c8818727bfa7eeb435f73328e18250faafaf7bc8b20c5",
+    "status": "modified"
+  }
+]
